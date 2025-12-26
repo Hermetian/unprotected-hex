@@ -9,6 +9,10 @@ const zoomSlider = document.getElementById('zoomSlider');
 const zoomValue = document.getElementById('zoomValue');
 const speedSlider = document.getElementById('speedSlider');
 const speedValue = document.getElementById('speedValue');
+const modeSelect = document.getElementById('modeSelect');
+
+// Game mode
+let gameMode = 'escape';  // 'escape' | 'hexvshex'
 
 // WebGL setup
 const gl = canvas.getContext('webgl2');
@@ -51,10 +55,15 @@ let panOffset = { x: 0, y: 0 };
 let isDragging = false;
 let lastMouse = { x: 0, y: 0 };
 
-// Run history - persistent
+// Run history - persistent (escape mode)
 const STORAGE_KEY = 'unprotected-hex-runs';
 let runHistory = [];  // Array of {escaped, distance, hexCount, timestamp, interrupted}
 let currentRunId = null;  // Track in-progress run
+
+// Hex vs Hex run history - persistent (separate from escape mode)
+const HVH_STORAGE_KEY = 'unprotected-hex-hvh-runs';
+let hvhRunHistory = [];  // Array of {winner, distance, hexCount, timestamp, interrupted}
+let hvhCurrentRunId = null;
 
 function loadRunHistory() {
     try {
@@ -127,13 +136,89 @@ function getRunStats() {
     return { total: runHistory.length, escaped, encircled, interrupted };
 }
 
+// Hex vs Hex history functions
+function loadHvhHistory() {
+    try {
+        const saved = localStorage.getItem(HVH_STORAGE_KEY);
+        if (saved) {
+            hvhRunHistory = JSON.parse(saved);
+            for (const run of hvhRunHistory) {
+                if (run.inProgress) {
+                    run.inProgress = false;
+                    run.interrupted = true;
+                }
+            }
+            saveHvhHistory();
+        }
+    } catch (e) {
+        console.error('Failed to load hvh run history:', e);
+        hvhRunHistory = [];
+    }
+}
+
+function saveHvhHistory() {
+    try {
+        localStorage.setItem(HVH_STORAGE_KEY, JSON.stringify(hvhRunHistory));
+    } catch (e) {
+        console.error('Failed to save hvh run history:', e);
+    }
+}
+
+function startHvhRun() {
+    hvhCurrentRunId = hvhRunHistory.length;
+    hvhRunHistory.push({
+        winner: null,  // 'white', 'black', or 'unresolved'
+        distance: 0,
+        hexCount: 0,
+        timestamp: Date.now(),
+        interrupted: false,
+        inProgress: true
+    });
+    saveHvhHistory();
+}
+
+function endHvhRun(winner, distance) {
+    if (hvhCurrentRunId !== null && hvhRunHistory[hvhCurrentRunId]) {
+        hvhRunHistory[hvhCurrentRunId].winner = winner;
+        hvhRunHistory[hvhCurrentRunId].distance = distance;
+        hvhRunHistory[hvhCurrentRunId].hexCount = hexInstances.length;
+        hvhRunHistory[hvhCurrentRunId].inProgress = false;
+        saveHvhHistory();
+        hvhCurrentRunId = null;
+    }
+}
+
+function interruptHvhRun(distanceSoFar) {
+    if (hvhCurrentRunId !== null && hvhRunHistory[hvhCurrentRunId]) {
+        hvhRunHistory[hvhCurrentRunId].distance = distanceSoFar;
+        hvhRunHistory[hvhCurrentRunId].hexCount = hexInstances.length;
+        hvhRunHistory[hvhCurrentRunId].interrupted = true;
+        hvhRunHistory[hvhCurrentRunId].inProgress = false;
+        saveHvhHistory();
+        hvhCurrentRunId = null;
+    }
+}
+
+function getHvhStats() {
+    const completed = hvhRunHistory.filter(r => !r.interrupted);
+    const whiteWins = completed.filter(r => r.winner === 'white').length;
+    const blackWins = completed.filter(r => r.winner === 'black').length;
+    const unresolved = completed.filter(r => r.winner === 'unresolved').length;
+    const interrupted = hvhRunHistory.filter(r => r.interrupted).length;
+    return { total: hvhRunHistory.length, whiteWins, blackWins, unresolved, interrupted };
+}
+
 // Track current distance for interruption
 let currentMaxDist = 0;
 
 // Handle page unload during run
 window.addEventListener('beforeunload', () => {
     if (isRunning) {
-        interruptRun(currentMaxDist);
+        if (gameMode === 'escape') {
+            interruptRun(currentMaxDist);
+        } else {
+            interruptHvhRun(currentMaxDist);
+        }
     }
 });
 
@@ -169,7 +254,7 @@ void main() {
     gl_Position = vec4(clipSpace.x, -clipSpace.y, 0.0, 1.0);
 
     // Color
-    v_color = a_color > 0.5 ? vec3(1.0, 1.0, 1.0) : vec3(0.0, 0.0, 0.0);
+    v_color = a_color > 0.5 ? vec3(1.0, 1.0, 1.0) : vec3(0.2, 0.2, 0.25);
 }
 `;
 
@@ -503,6 +588,298 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Hex vs Hex algorithm functions
+
+// Calculate hex distance from origin (in hex steps)
+function hexDist(q, r) {
+    return (Math.abs(q) + Math.abs(r) + Math.abs(-q - r)) / 2;
+}
+
+// Calculate clockwise angle from East (0 to 2π)
+function clockwiseAngle(q, r) {
+    const x = q + r / 2;
+    const y = r * Math.sqrt(3) / 2;
+    // atan2 gives counter-clockwise from East, we want clockwise
+    const ccw = Math.atan2(y, x);
+    return (2 * Math.PI - ccw + 2 * Math.PI) % (2 * Math.PI);
+}
+
+// Select next frontier hex: outermost, then clockwise-most
+function selectNextFrontierHex(frontier) {
+    let bestKey = null;
+    let bestDist = -1;
+    let bestAngle = -1;
+
+    for (const key of frontier) {
+        const { q, r } = decodeKey(key);
+        const dist = hexDist(q, r);
+        const angle = clockwiseAngle(q, r);
+
+        if (dist > bestDist || (dist === bestDist && angle > bestAngle)) {
+            bestKey = key;
+            bestDist = dist;
+            bestAngle = angle;
+        }
+    }
+
+    return bestKey;
+}
+
+// Check if a specific hex is trapped (can't reach distance D through untested hexes)
+// Returns true only if completely surrounded by opposite color
+function isHexTrapped(startQ, startR, maxDist) {
+    const startKey = numKey(startQ, startR);
+    const startColor = hexColors.get(startKey);
+    if (startColor === undefined) return false;
+
+    // Step 1: Find all connected same-color hexes
+    const sameColorRegion = new Set([startKey]);
+    const sameColorQueue = [startKey];
+    let head = 0;
+
+    while (head < sameColorQueue.length) {
+        const key = sameColorQueue[head++];
+        const { q, r } = decodeKey(key);
+
+        for (let i = 0; i < 6; i++) {
+            const nq = q + NEIGHBOR_OFFSETS[i][0];
+            const nr = r + NEIGHBOR_OFFSETS[i][1];
+            const nk = numKey(nq, nr);
+
+            if (sameColorRegion.has(nk)) continue;
+            if (hexColors.get(nk) === startColor) {
+                sameColorRegion.add(nk);
+                sameColorQueue.push(nk);
+            }
+        }
+    }
+
+    // Step 2: Find all untested hexes adjacent to this region
+    const untestedFrontier = new Set();
+    for (const key of sameColorRegion) {
+        const { q, r } = decodeKey(key);
+        for (let i = 0; i < 6; i++) {
+            const nq = q + NEIGHBOR_OFFSETS[i][0];
+            const nr = r + NEIGHBOR_OFFSETS[i][1];
+            const nk = numKey(nq, nr);
+            if (!hexColors.has(nk)) {
+                untestedFrontier.add(nk);
+            }
+        }
+    }
+
+    // If no untested frontier, we're completely surrounded by opposite color
+    if (untestedFrontier.size === 0) {
+        return true;
+    }
+
+    // Step 3: Check if any untested frontier hex can reach distance D
+    // We do a limited BFS from each frontier hex through untested space
+    const MAX_UNTESTED_SEARCH = 10000;
+    const visited = new Set();
+    const queue = [];
+
+    for (const key of untestedFrontier) {
+        visited.add(key);
+        queue.push(key);
+    }
+
+    head = 0;
+    while (head < queue.length && head < MAX_UNTESTED_SEARCH) {
+        const key = queue[head++];
+        const { q, r } = decodeKey(key);
+
+        // If this untested hex is at distance >= maxDist, we can escape
+        if (hexDist(q, r) >= maxDist) {
+            return false;
+        }
+
+        // Expand through untested hexes only
+        for (let i = 0; i < 6; i++) {
+            const nq = q + NEIGHBOR_OFFSETS[i][0];
+            const nr = r + NEIGHBOR_OFFSETS[i][1];
+            const nk = numKey(nq, nr);
+
+            if (visited.has(nk)) continue;
+
+            const neighborColor = hexColors.get(nk);
+            if (neighborColor === undefined) {
+                // Untested - continue search
+                visited.add(nk);
+                queue.push(nk);
+            }
+            // If it's opposite color, it blocks this path
+            // If it's same color, we already counted it in sameColorRegion
+        }
+    }
+
+    // If we searched a lot without finding escape, assume we can escape
+    // (the untested space is vast, we just didn't search far enough)
+    if (head >= MAX_UNTESTED_SEARCH) {
+        return false;
+    }
+
+    // If BFS exhausted without finding escape, we're truly trapped
+    return true;
+}
+
+// Get what colors an untested hex touches
+function getTouchedColors(q, r) {
+    let touchesWhite = false;
+    let touchesBlack = false;
+
+    for (let i = 0; i < 6; i++) {
+        const nq = q + NEIGHBOR_OFFSETS[i][0];
+        const nr = r + NEIGHBOR_OFFSETS[i][1];
+        const nk = numKey(nq, nr);
+        const color = hexColors.get(nk);
+        if (color === true) touchesWhite = true;
+        if (color === false) touchesBlack = true;
+    }
+
+    return { touchesWhite, touchesBlack };
+}
+
+// Get combined frontier (untested hexes adjacent to either color)
+// Returns { boundary, whiteFrontier, blackFrontier }
+function getFrontiers() {
+    const boundary = new Set();      // Touches both colors
+    const whiteFrontier = new Set(); // Touches only white
+    const blackFrontier = new Set(); // Touches only black
+    const seen = new Set();
+
+    for (const [key] of hexColors) {
+        const { q, r } = decodeKey(key);
+        for (let i = 0; i < 6; i++) {
+            const nq = q + NEIGHBOR_OFFSETS[i][0];
+            const nr = r + NEIGHBOR_OFFSETS[i][1];
+            const nk = numKey(nq, nr);
+
+            if (hexColors.has(nk) || seen.has(nk)) continue;
+            seen.add(nk);
+
+            const { touchesWhite, touchesBlack } = getTouchedColors(nq, nr);
+
+            if (touchesWhite && touchesBlack) {
+                boundary.add(nk);
+            } else if (touchesWhite) {
+                whiteFrontier.add(nk);
+            } else if (touchesBlack) {
+                blackFrontier.add(nk);
+            }
+        }
+    }
+
+    return { boundary, whiteFrontier, blackFrontier };
+}
+
+// Main hex vs hex check loop
+async function hexVsHexCheck() {
+    const ESCAPE_DISTANCE = 10000;
+    const BASE_MAX_DELAY = 50;
+    const BASE_MIN_DELAY = 1;
+
+    // Track the original starting positions
+    const whiteStartQ = startHex.q;
+    const whiteStartR = startHex.r;
+    const blackStartQ = startHex.q + 1;
+    const blackStartR = startHex.r;
+
+    let stepCount = 0;
+    let maxDistReached = 0;
+    let lastRenderTime = performance.now();
+
+    while (true) {
+        const { boundary } = getFrontiers();
+
+        // Only test boundary hexes - hexes that touch both colors
+        // When boundary is empty, the colors have separated and outcome is determined
+        if (boundary.size === 0) {
+            break;
+        }
+
+        const nextKey = selectNextFrontierHex(boundary);
+        if (nextKey === null) {
+            break;
+        }
+
+        const { q, r } = decodeKey(nextKey);
+
+        // Color it randomly
+        const isWhite = Math.random() < 0.5;
+        hexColors.set(nextKey, isWhite);
+        hexInstances.push({ q, r, color: isWhite ? 1 : 0 });
+        instanceBufferDirty = true;
+
+        const dist = hexDist(q, r);
+        maxDistReached = Math.max(maxDistReached, dist);
+        currentMaxDist = maxDistReached;
+        stepCount++;
+
+        // Check distance limit
+        if (maxDistReached >= ESCAPE_DISTANCE) {
+            render();
+            return { winner: 'unresolved', distance: maxDistReached };
+        }
+
+        // Check win conditions after every hex - check if ORIGINAL hexes are trapped
+        const whiteTrapped = isHexTrapped(whiteStartQ, whiteStartR, ESCAPE_DISTANCE);
+        const blackTrapped = isHexTrapped(blackStartQ, blackStartR, ESCAPE_DISTANCE);
+
+        if (whiteTrapped && !blackTrapped) {
+            render();
+            return { winner: 'black', distance: maxDistReached };
+        }
+        if (blackTrapped && !whiteTrapped) {
+            render();
+            return { winner: 'white', distance: maxDistReached };
+        }
+        if (whiteTrapped && blackTrapped) {
+            render();
+            return { winner: 'unresolved', distance: maxDistReached };
+        }
+
+        // Rendering and delays
+        const isMaxSpeed = speedMultiplier === Infinity;
+        const baseDelay = Math.max(BASE_MIN_DELAY, BASE_MAX_DELAY / Math.sqrt(boundary.size + 1));
+        const delay = isMaxSpeed ? 0 : baseDelay / speedMultiplier;
+
+        if (isMaxSpeed) {
+            if (stepCount % 1000 === 0) {
+                const now = performance.now();
+                if (now - lastRenderTime > 50) {
+                    statusDiv.textContent = `Distance: ${Math.round(maxDistReached)} | Boundary: ${boundary.size} | Hexes: ${hexInstances.length}`;
+                    render();
+                    lastRenderTime = now;
+                }
+                await sleep(0);
+            }
+        } else {
+            const batchSize = Math.max(1, Math.floor((boundary.size + 1) / 5 * speedMultiplier));
+            if (stepCount % batchSize === 0) {
+                const now = performance.now();
+                if (now - lastRenderTime > 16) {
+                    statusDiv.textContent = `Distance: ${Math.round(maxDistReached)} | Boundary: ${boundary.size} | Hexes: ${hexInstances.length}`;
+                    render();
+                    lastRenderTime = now;
+                }
+                if (delay > 0) {
+                    await sleep(delay);
+                }
+            }
+        }
+    }
+
+    // Frontier exhausted - check final state
+    render();
+    const whiteTrapped = isHexTrapped(whiteStartQ, whiteStartR, ESCAPE_DISTANCE);
+    const blackTrapped = isHexTrapped(blackStartQ, blackStartR, ESCAPE_DISTANCE);
+
+    if (whiteTrapped && !blackTrapped) return { winner: 'black', distance: maxDistReached };
+    if (blackTrapped && !whiteTrapped) return { winner: 'white', distance: maxDistReached };
+    return { winner: 'unresolved', distance: maxDistReached };
+}
+
 // Find encircled pockets
 function findEncircledPockets() {
     const pocketSizes = [];
@@ -585,9 +962,17 @@ function handleClick(e) {
 
     if (!startHex) {
         startHex = hex;
-        setHexColor(hex.q, hex.r, true);
+        setHexColor(hex.q, hex.r, true);  // White hex at click location
+
+        if (gameMode === 'hexvshex') {
+            // Place black hex to the right
+            setHexColor(hex.q + 1, hex.r, false);
+            startBtn.textContent = 'Start Battle';
+        } else {
+            startBtn.textContent = 'Check Encirclement';
+        }
+
         render();
-        startBtn.textContent = 'Check Encirclement';
         startBtn.disabled = false;
     }
 }
@@ -599,8 +984,20 @@ async function startCheck() {
     currentMaxDist = 0;
     startBtn.disabled = true;
     resetBtn.disabled = true;
+    modeSelect.disabled = true;
     statusDiv.className = '';
 
+    if (gameMode === 'hexvshex') {
+        await startHvhCheck();
+    } else {
+        await startEscapeCheck();
+    }
+
+    isRunning = false;
+    resetBtn.disabled = false;
+}
+
+async function startEscapeCheck() {
     startRun();  // Begin tracking
 
     const result = await checkEncirclement(startHex.q, startHex.r);
@@ -631,15 +1028,40 @@ async function startCheck() {
     }
 
     console.log('Run History:', runHistory);
+}
 
-    isRunning = false;
-    resetBtn.disabled = false;
+async function startHvhCheck() {
+    startHvhRun();  // Begin tracking
+
+    const result = await hexVsHexCheck();
+
+    endHvhRun(result.winner, result.distance);  // Finish tracking
+
+    const stats = getHvhStats();
+    const historyInfo = ` | #${stats.total} [${stats.whiteWins}W/${stats.blackWins}B/${stats.unresolved}U${stats.interrupted ? '/' + stats.interrupted + 'I' : ''}]`;
+
+    if (result.winner === 'white') {
+        statusDiv.textContent = `WHITE WINS @ dist ${Math.round(result.distance)}${historyInfo}`;
+        statusDiv.className = 'escaped';  // Green for white
+    } else if (result.winner === 'black') {
+        statusDiv.textContent = `BLACK WINS @ dist ${Math.round(result.distance)}${historyInfo}`;
+        statusDiv.className = 'encircled';  // Red for black
+    } else {
+        statusDiv.textContent = `UNRESOLVED @ dist ${Math.round(result.distance)}${historyInfo}`;
+        statusDiv.className = '';
+    }
+
+    console.log('HvH Run History:', hvhRunHistory);
 }
 
 function reset() {
     // Interrupt current run if in progress
     if (isRunning) {
-        interruptRun(currentMaxDist);
+        if (gameMode === 'escape') {
+            interruptRun(currentMaxDist);
+        } else {
+            interruptHvhRun(currentMaxDist);
+        }
     }
 
     hexColors.clear();
@@ -649,6 +1071,7 @@ function reset() {
     isRunning = false;
     startBtn.textContent = 'Click a hexagon to start';
     startBtn.disabled = true;
+    modeSelect.disabled = false;
     statusDiv.textContent = '';
     statusDiv.className = '';
     render();
@@ -745,13 +1168,25 @@ speedSlider.addEventListener('input', (e) => {
     updateSpeedFromSlider(parseFloat(e.target.value));
 });
 
+// Mode change handler
+modeSelect.addEventListener('change', (e) => {
+    if (isRunning) return;  // Don't change mode during run
+    gameMode = e.target.value;
+    reset();  // Reset when mode changes
+});
+
 // Initialize
 loadRunHistory();
+loadHvhHistory();
 updateSpeedFromSlider(parseFloat(speedSlider.value));
 resize();
 
 // Log loaded history
 const stats = getRunStats();
 if (stats.total > 0) {
-    console.log(`Loaded ${stats.total} runs: ${stats.escaped}E/${stats.encircled}C/${stats.interrupted}I`);
+    console.log(`Loaded ${stats.total} escape runs: ${stats.escaped}E/${stats.encircled}C/${stats.interrupted}I`);
+}
+const hvhStats = getHvhStats();
+if (hvhStats.total > 0) {
+    console.log(`Loaded ${hvhStats.total} HvH runs: ${hvhStats.whiteWins}W/${hvhStats.blackWins}B/${hvhStats.unresolved}U/${hvhStats.interrupted}I`);
 }
