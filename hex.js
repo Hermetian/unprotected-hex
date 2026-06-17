@@ -6,6 +6,7 @@ import {
     numKey, decodeKey, hexDist, clockwiseAngle,
     selectNextFrontierHex, pixelToAxial,
     getTouchedColors, getFrontiers, isHexTrapped, findEncircledPockets,
+    sliderToSpeed, speedToLabel, computePacing,
 } from './hex-core.js';
 import { RunTracker } from './run-tracker.js';
 
@@ -161,7 +162,15 @@ function createProgram(gl, vertexShader, fragmentShader) {
 // Initialize WebGL
 const vertexShader = compileShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
 const fragmentShader = compileShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+if (!vertexShader || !fragmentShader) {
+    alert('Failed to compile WebGL shaders');
+    throw new Error('Failed to compile WebGL shaders');
+}
 const program = createProgram(gl, vertexShader, fragmentShader);
+if (!program) {
+    alert('Failed to link WebGL program');
+    throw new Error('Failed to link WebGL program');
+}
 
 // Get locations
 const a_vertex = gl.getAttribLocation(program, 'a_vertex');
@@ -359,9 +368,7 @@ async function checkEncirclement(startQ, startR) {
         currentMaxDist = maxDistReached;  // Track for interruption
 
         const exposedCount = queueQ.length - queueHead + 1;
-        const isMaxSpeed = speedMultiplier === Infinity;
-        const baseDelay = Math.max(CONFIG.BASE_MIN_DELAY, CONFIG.BASE_MAX_DELAY / Math.sqrt(exposedCount));
-        const delay = isMaxSpeed ? 0 : baseDelay / speedMultiplier;
+        const { isMaxSpeed, delay, batchSize } = computePacing(exposedCount, speedMultiplier);
 
         if (dist >= CONFIG.ESCAPE_DISTANCE) {
             render();
@@ -396,7 +403,6 @@ async function checkEncirclement(startQ, startR) {
                     await sleep(0);
                 }
             } else {
-                const batchSize = Math.max(1, Math.floor(exposedCount / 5 * speedMultiplier));
                 if (stepCount % batchSize === 0) {
                     const now = performance.now();
                     if (now - lastRenderTime > 16) {
@@ -483,9 +489,7 @@ async function hexVsHexCheck() {
         }
 
         // Rendering and delays
-        const isMaxSpeed = speedMultiplier === Infinity;
-        const baseDelay = Math.max(CONFIG.BASE_MIN_DELAY, CONFIG.BASE_MAX_DELAY / Math.sqrt(boundary.size + 1));
-        const delay = isMaxSpeed ? 0 : baseDelay / speedMultiplier;
+        const { isMaxSpeed, delay, batchSize } = computePacing(boundary.size + 1, speedMultiplier);
 
         if (isMaxSpeed) {
             if (stepCount % 1000 === 0) {
@@ -498,7 +502,6 @@ async function hexVsHexCheck() {
                 await sleep(0);
             }
         } else {
-            const batchSize = Math.max(1, Math.floor((boundary.size + 1) / 5 * speedMultiplier));
             if (stepCount % batchSize === 0) {
                 const now = performance.now();
                 if (now - lastRenderTime > 16) {
@@ -720,18 +723,6 @@ canvas.addEventListener('wheel', (e) => {
 }, { passive: false });
 
 // Speed control
-function sliderToSpeed(val) {
-    if (val >= 5) return Infinity;
-    return 0.25 * Math.pow(2, val);
-}
-
-function speedToLabel(speed) {
-    if (speed === Infinity) return 'MAX';
-    if (speed < 1) return speed.toFixed(2) + 'x';
-    if (speed >= 10) return Math.round(speed) + 'x';
-    return speed.toFixed(1) + 'x';
-}
-
 function updateSpeedFromSlider(val) {
     speedMultiplier = sliderToSpeed(val);
     speedValue.textContent = speedToLabel(speedMultiplier);

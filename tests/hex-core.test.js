@@ -4,6 +4,7 @@ import {
     numKey, decodeKey, axialRound, hexDist, clockwiseAngle,
     selectNextFrontierHex, pixelToAxial,
     getTouchedColors, getFrontiers, isHexTrapped, findEncircledPockets,
+    sliderToSpeed, speedToLabel, computePacing,
 } from '../hex-core.js';
 
 // --- numKey / decodeKey ---
@@ -241,6 +242,15 @@ describe('getFrontiers', () => {
         expect(boundary.size).toBe(0);
     });
 
+    it('finds black frontier around a single black hex', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), false);
+        const { boundary, whiteFrontier, blackFrontier } = getFrontiers(hexColors);
+        expect(blackFrontier.size).toBe(6);  // All 6 neighbors are black frontier
+        expect(whiteFrontier.size).toBe(0);
+        expect(boundary.size).toBe(0);
+    });
+
     it('finds boundary hexes between white and black', () => {
         const hexColors = new Map();
         hexColors.set(numKey(0, 0), true);   // White
@@ -248,6 +258,21 @@ describe('getFrontiers', () => {
         const { boundary } = getFrontiers(hexColors);
         // (1,0) is adjacent to both white (0,0) and black (2,0), so it's boundary
         expect(boundary.has(numKey(1, 0))).toBe(true);
+    });
+
+    it('keeps boundary hexes out of the single-color frontiers', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);   // White
+        hexColors.set(numKey(2, 0), false);  // Black
+        const { boundary, whiteFrontier, blackFrontier } = getFrontiers(hexColors);
+        const between = numKey(1, 0);
+        // The shared neighbor is boundary, never in a single-color frontier
+        expect(boundary.has(between)).toBe(true);
+        expect(whiteFrontier.has(between)).toBe(false);
+        expect(blackFrontier.has(between)).toBe(false);
+        // Each color's 6 neighbors minus the shared boundary cell = 5 single-color frontier cells
+        expect(whiteFrontier.size).toBe(5);
+        expect(blackFrontier.size).toBe(5);
     });
 });
 
@@ -289,6 +314,28 @@ describe('isHexTrapped', () => {
         hexColors.set(numKey(2, 0), true);
         // Not surrounded — plenty of untested neighbors
         expect(isHexTrapped(0, 0, 100, hexColors)).toBe(false);
+    });
+
+    it('returns false when wide-open space lets the color reach the target distance', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);  // Lone white hex in open space
+        // The untested frontier expands freely, so distance 3 is reachable
+        expect(isHexTrapped(0, 0, 3, hexColors)).toBe(false);
+    });
+
+    it('returns true when sealed in a finite cavity it cannot escape', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);  // White center
+        // Black wall at distance 2; the distance-1 ring is left untested (the cavity).
+        // The cavity is non-empty but bounded, so the region can never reach distance 10.
+        for (let q = -2; q <= 2; q++) {
+            for (let r = -2; r <= 2; r++) {
+                if (hexDist(q, r) === 2) hexColors.set(numKey(q, r), false);
+            }
+        }
+        expect(isHexTrapped(0, 0, 10, hexColors)).toBe(true);
+        // A frontier hex already sits at distance 1, so a target of 1 is trivially reached.
+        expect(isHexTrapped(0, 0, 1, hexColors)).toBe(false);
     });
 });
 
@@ -343,5 +390,96 @@ describe('findEncircledPockets', () => {
         expect(pockets.length).toBeGreaterThan(0);
         // The pocket contains at least the origin
         expect(pockets[0]).toBeGreaterThanOrEqual(1);
+    });
+
+    it('reports the exact size of a fully sealed two-cell pocket', () => {
+        const hexColors = new Map();
+        // Two untested interior cells...
+        const interior = [[0, 0], [1, 0]];
+        const interiorKeys = new Set(interior.map(([q, r]) => numKey(q, r)));
+        // ...sealed by black on every surrounding cell.
+        for (const [q, r] of interior) {
+            for (const [dq, dr] of NEIGHBOR_OFFSETS) {
+                const k = numKey(q + dq, r + dr);
+                if (!interiorKeys.has(k)) hexColors.set(k, false);
+            }
+        }
+        const pockets = findEncircledPockets(hexColors);
+        // The only black-enclosed untested region is the 2-cell interior.
+        // (The outer untested plane is unbounded and exceeds MAX_POCKET_SIZE.)
+        expect(pockets).toEqual([2]);
+    });
+});
+
+// --- sliderToSpeed ---
+
+describe('sliderToSpeed', () => {
+    it('maps the bottom of the range to 0.25x', () => {
+        expect(sliderToSpeed(0)).toBe(0.25);
+    });
+
+    it('doubles per slider unit', () => {
+        expect(sliderToSpeed(1)).toBe(0.5);
+        expect(sliderToSpeed(2)).toBe(1);
+        expect(sliderToSpeed(4)).toBe(4);
+    });
+
+    it('treats the top of the range as max (infinite) speed', () => {
+        expect(sliderToSpeed(5)).toBe(Infinity);
+        expect(sliderToSpeed(6)).toBe(Infinity);
+    });
+});
+
+// --- speedToLabel ---
+
+describe('speedToLabel', () => {
+    it('labels max speed', () => {
+        expect(speedToLabel(Infinity)).toBe('MAX');
+    });
+
+    it('uses two decimals below 1x', () => {
+        expect(speedToLabel(0.25)).toBe('0.25x');
+        expect(speedToLabel(0.5)).toBe('0.50x');
+    });
+
+    it('uses one decimal for normal speeds', () => {
+        expect(speedToLabel(1)).toBe('1.0x');
+        expect(speedToLabel(4)).toBe('4.0x');
+    });
+
+    it('rounds to an integer at 10x and above', () => {
+        expect(speedToLabel(16)).toBe('16x');
+    });
+});
+
+// --- computePacing ---
+
+describe('computePacing', () => {
+    it('reports max speed with zero delay', () => {
+        const p = computePacing(100, Infinity);
+        expect(p.isMaxSpeed).toBe(true);
+        expect(p.delay).toBe(0);
+    });
+
+    it('slows down (larger delay) when the frontier is small', () => {
+        const small = computePacing(1, 1);
+        const large = computePacing(400, 1);
+        expect(small.delay).toBeGreaterThan(large.delay);
+    });
+
+    it('clamps delay to the configured minimum for huge frontiers', () => {
+        const p = computePacing(1e9, 1);
+        expect(p.delay).toBe(CONFIG.BASE_MIN_DELAY);
+        expect(p.isMaxSpeed).toBe(false);
+    });
+
+    it('grows the batch size with the speed multiplier', () => {
+        const slow = computePacing(100, 1);
+        const fast = computePacing(100, 4);
+        expect(fast.batchSize).toBeGreaterThan(slow.batchSize);
+    });
+
+    it('never returns a batch size below 1', () => {
+        expect(computePacing(1, 0.25).batchSize).toBe(1);
     });
 });

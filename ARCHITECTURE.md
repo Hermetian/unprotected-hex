@@ -32,6 +32,8 @@ Exports:
 - `getFrontiers(hexColors)` — Categorize untested hexes into boundary/white/black frontier
 - `isHexTrapped(q, r, maxDist, hexColors)` — Can a hex's color region escape to open space?
 - `findEncircledPockets(hexColors)` — Find untested regions surrounded only by black
+- `sliderToSpeed(value)` / `speedToLabel(speed)` — Map the speed slider to a multiplier and its display label
+- `computePacing(count, speedMultiplier)` — Per-step animation pacing (batch size + delay) from the live frontier size
 
 ### run-tracker.js
 Generic run history tracker used for both game modes. Accepts a `storage` adapter (defaults to `localStorage`) for testability.

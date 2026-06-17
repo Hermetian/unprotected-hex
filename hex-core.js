@@ -292,3 +292,36 @@ export function findEncircledPockets(hexColors) {
 
     return pocketSizes;
 }
+
+// --- Animation pacing (pure) ---
+// These drive how fast the BFS/boundary loops animate. Kept here, free of DOM
+// state, so the speed mapping and per-step throttling are independently testable.
+
+// Map a speed-slider value (0..5) to a speed multiplier.
+// Exponential 0.25x..8x, with the top of the range meaning "max speed" (no delay).
+export function sliderToSpeed(value) {
+    if (value >= 5) return Infinity;
+    return 0.25 * Math.pow(2, value);
+}
+
+// Human-readable label for a speed multiplier.
+export function speedToLabel(speed) {
+    if (speed === Infinity) return 'MAX';
+    if (speed < 1) return speed.toFixed(2) + 'x';
+    if (speed >= 10) return Math.round(speed) + 'x';
+    return speed.toFixed(1) + 'x';
+}
+
+// Compute per-step animation pacing from the live frontier size and speed multiplier.
+// `count` is the number of "exposed" hexes driving the animation (BFS frontier or
+// boundary set) and must be >= 1. Returns:
+//   - isMaxSpeed: whether to skip delays entirely
+//   - delay:      milliseconds to sleep between rendered batches
+//   - batchSize:  how many steps to process between renders (larger = faster/coarser)
+export function computePacing(count, speedMultiplier) {
+    const isMaxSpeed = speedMultiplier === Infinity;
+    const baseDelay = Math.max(CONFIG.BASE_MIN_DELAY, CONFIG.BASE_MAX_DELAY / Math.sqrt(count));
+    const delay = isMaxSpeed ? 0 : baseDelay / speedMultiplier;
+    const batchSize = Math.max(1, Math.floor(count / 5 * speedMultiplier));
+    return { isMaxSpeed, delay, batchSize };
+}
