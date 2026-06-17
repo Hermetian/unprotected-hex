@@ -11,6 +11,7 @@ A browser-based hex grid game with two modes:
 ```
 hex-core.js      Pure logic (constants, coordinate math, BFS algorithms)
 run-tracker.js   RunTracker class (game history with pluggable storage)
+run-session.js   RunSession class (cancellation token for the in-flight run)
 hex.js           Main application (WebGL rendering, DOM, game loop)
 index.html       Entry point (loads hex.js as ES module)
 style.css        Styles
@@ -38,11 +39,14 @@ Exports:
 ### run-tracker.js
 Generic run history tracker used for both game modes. Accepts a `storage` adapter (defaults to `localStorage`) for testability.
 
+### run-session.js
+A one-class module owning a monotonic generation counter. The escape/battle loops in `hex.js` are long-running async functions that `await` between animation batches; while one is suspended the user can hit **Reset**, switch modes, or start a new run. Each run captures a token from `runSession.begin()`, and after every `await` checks `runSession.isCurrent(token)` — once a newer `begin()` or a `cancel()` (fired by `reset()`) has advanced the counter, the token is stale and the loop returns `{ cancelled: true }` instead of continuing to mutate the (now cleared) grid. This prevents a superseded loop from spawning ghost hexes onto a reset board or clobbering the status line.
+
 ### hex.js
-The main application file. Imports from `hex-core.js` and `run-tracker.js`. Handles:
+The main application file. Imports from `hex-core.js`, `run-tracker.js`, and `run-session.js`. Handles:
 - WebGL2 instanced rendering (hex geometry as triangle fan)
 - Canvas overlay for start hex marker
-- BFS game loops (`checkEncirclement`, `hexVsHexCheck`)
+- BFS game loops (`checkEncirclement`, `hexVsHexCheck`), cancellable via the shared `runSession`
 - User interaction (click placement, pan, zoom, speed control)
 - Two `RunTracker` instances (`escapeTracker`, `hvhTracker`)
 
@@ -70,4 +74,5 @@ Coordinates are encoded as numeric keys via `numKey(q, r)` for fast Map lookups,
 - Framework: Vitest (ES module native, no build step)
 - `tests/hex-core.test.js` — Pure logic tests (coordinate math, BFS, pocket detection)
 - `tests/run-tracker.test.js` — Run tracking with in-memory storage adapter
+- `tests/run-session.test.js` — Run cancellation token (begin/cancel/supersede semantics)
 - Run: `npm test`

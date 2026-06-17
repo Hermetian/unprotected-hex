@@ -9,6 +9,7 @@ import {
     sliderToSpeed, speedToLabel, computePacing,
 } from './hex-core.js';
 import { RunTracker } from './run-tracker.js';
+import { RunSession } from './run-session.js';
 
 const canvas = document.getElementById('canvas');
 const startBtn = document.getElementById('startBtn');
@@ -40,6 +41,9 @@ let hexInstances = [];          // Array of {q, r, color} for GPU upload
 let instanceBufferDirty = true;
 let startHex = null;
 let isRunning = false;
+// Cancels an in-flight escape/battle loop when the user resets, switches mode,
+// or starts a new run, so the old loop stops mutating the grid. See run-session.js.
+const runSession = new RunSession();
 let panOffset = { x: 0, y: 0 };
 let isDragging = false;
 let lastMouse = { x: 0, y: 0 };
@@ -171,6 +175,9 @@ if (!program) {
     alert('Failed to link WebGL program');
     throw new Error('Failed to link WebGL program');
 }
+// The linked program keeps its own copies; the shader objects are no longer needed.
+gl.deleteShader(vertexShader);
+gl.deleteShader(fragmentShader);
 
 // Get locations
 const a_vertex = gl.getAttribLocation(program, 'a_vertex');
@@ -348,7 +355,7 @@ function drawStartMarker() {
 }
 
 // BFS encirclement check
-async function checkEncirclement(startQ, startR) {
+async function checkEncirclement(startQ, startR, token) {
     const visited = new Set();
     const queueQ = [startQ];
     const queueR = [startR];
@@ -401,6 +408,9 @@ async function checkEncirclement(startQ, startR) {
                         lastRenderTime = now;
                     }
                     await sleep(0);
+                    // A Reset/mode-switch during the await invalidates our token;
+                    // bail out before touching the (now cleared) grid again.
+                    if (!runSession.isCurrent(token)) return { cancelled: true };
                 }
             } else {
                 if (stepCount % batchSize === 0) {
@@ -412,6 +422,7 @@ async function checkEncirclement(startQ, startR) {
                     }
                     if (delay > 0) {
                         await sleep(delay);
+                        if (!runSession.isCurrent(token)) return { cancelled: true };
                     }
                 }
             }
@@ -427,7 +438,7 @@ function sleep(ms) {
 }
 
 // Main hex vs hex check loop
-async function hexVsHexCheck() {
+async function hexVsHexCheck(token) {
     // Track the original starting positions
     const whiteStartQ = startHex.q;
     const whiteStartR = startHex.r;
@@ -500,6 +511,8 @@ async function hexVsHexCheck() {
                     lastRenderTime = now;
                 }
                 await sleep(0);
+                // Superseded by a Reset/mode-switch — stop before mutating further.
+                if (!runSession.isCurrent(token)) return { cancelled: true };
             }
         } else {
             if (stepCount % batchSize === 0) {
@@ -511,6 +524,7 @@ async function hexVsHexCheck() {
                 }
                 if (delay > 0) {
                     await sleep(delay);
+                    if (!runSession.isCurrent(token)) return { cancelled: true };
                 }
             }
         }
@@ -556,6 +570,7 @@ function handleClick(e) {
 async function startCheck() {
     if (!startHex || isRunning) return;
 
+    const token = runSession.begin();
     isRunning = true;
     currentMaxDist = 0;
     startBtn.disabled = true;
@@ -564,24 +579,33 @@ async function startCheck() {
     statusDiv.className = '';
 
     if (gameMode === 'hexvshex') {
-        await startHvhCheck();
+        await startHvhCheck(token);
     } else {
-        await startEscapeCheck();
+        await startEscapeCheck(token);
     }
 
-    isRunning = false;
-    resetBtn.disabled = false;
+    // Only tear down if this run is still the active one. If a Reset (or a new
+    // run) superseded us, that handler already owns the UI/run state.
+    if (runSession.isCurrent(token)) {
+        isRunning = false;
+        resetBtn.disabled = false;
+    }
 }
 
-async function startEscapeCheck() {
+async function startEscapeCheck(token) {
     escapeTracker.startRun();
 
-    const result = await checkEncirclement(startHex.q, startHex.r);
+    const result = await checkEncirclement(startHex.q, startHex.r, token);
+
+    // Reset/mode-switch superseded this run; reset() already interrupted the
+    // tracker and cleared the board, so leave the UI alone.
+    if (result.cancelled) return;
 
     escapeTracker.endRun(result.escaped, result.distance, hexInstances.length);
 
     statusDiv.textContent = 'Analyzing pockets...';
     await sleep(0);
+    if (!runSession.isCurrent(token)) return;
     const pocketSizes = findEncircledPockets(hexColors);
     const numPockets = pocketSizes.length;
     const maxPocketSize = pocketSizes.length > 0 ? Math.max(...pocketSizes) : 0;
@@ -606,10 +630,12 @@ async function startEscapeCheck() {
     console.log('Run History:', escapeTracker.history);
 }
 
-async function startHvhCheck() {
+async function startHvhCheck(token) {
     hvhTracker.startRun();
 
-    const result = await hexVsHexCheck();
+    const result = await hexVsHexCheck(token);
+
+    if (result.cancelled) return;
 
     hvhTracker.endRun(result.winner, result.distance, hexInstances.length);
 
@@ -631,6 +657,9 @@ async function startHvhCheck() {
 }
 
 function reset() {
+    // Invalidate any in-flight run so its async loop stops mutating the grid.
+    runSession.cancel();
+
     // Interrupt current run if in progress
     if (isRunning) {
         if (gameMode === 'escape') {
