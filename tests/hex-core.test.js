@@ -3,9 +3,28 @@ import {
     CONFIG, NEIGHBOR_OFFSETS,
     numKey, decodeKey, axialRound, hexDist, clockwiseAngle,
     selectNextFrontierHex, pixelToAxial,
-    getTouchedColors, getFrontiers, isHexTrapped, findEncircledPockets,
+    getTouchedColors, getFrontiers, updateBoundaryForColored,
+    isHexTrapped, findEncircledPockets,
     sliderToSpeed, speedToLabel, computePacing,
 } from '../hex-core.js';
+
+// Deterministic PRNG (mulberry32) so the property tests below are reproducible
+// rather than depending on Math.random.
+function mulberry32(seed) {
+    return function () {
+        seed |= 0;
+        seed = (seed + 0x6D2B79F5) | 0;
+        let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+function setsEqual(a, b) {
+    if (a.size !== b.size) return false;
+    for (const v of a) if (!b.has(v)) return false;
+    return true;
+}
 
 // --- numKey / decodeKey ---
 
@@ -273,6 +292,125 @@ describe('getFrontiers', () => {
         // Each color's 6 neighbors minus the shared boundary cell = 5 single-color frontier cells
         expect(whiteFrontier.size).toBe(5);
         expect(blackFrontier.size).toBe(5);
+    });
+});
+
+// --- updateBoundaryForColored ---
+
+describe('updateBoundaryForColored', () => {
+    it('removes the just-colored cell from the boundary', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);   // White
+        hexColors.set(numKey(2, 0), false);  // Black
+        const boundary = getFrontiers(hexColors).boundary;
+        const between = numKey(1, 0);
+        expect(boundary.has(between)).toBe(true);
+
+        // Color the boundary cell — it's no longer untested, so it leaves.
+        hexColors.set(between, true);
+        updateBoundaryForColored(boundary, 1, 0, hexColors);
+        expect(boundary.has(between)).toBe(false);
+    });
+
+    it('adds an untested neighbor that now touches both colors', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);   // White, alone — no boundary yet
+        let boundary = getFrontiers(hexColors).boundary;
+        expect(boundary.size).toBe(0);
+
+        // Place a black cell two away; (1,0) borders both and becomes boundary.
+        hexColors.set(numKey(2, 0), false);
+        updateBoundaryForColored(boundary, 2, 0, hexColors);
+        expect(boundary.has(numKey(1, 0))).toBe(true);
+        expect(setsEqual(boundary, getFrontiers(hexColors).boundary)).toBe(true);
+    });
+
+    it('leaves the boundary unchanged when coloring touches only one color', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);
+        const boundary = getFrontiers(hexColors).boundary;  // empty
+        // Extend the white blob; still no black anywhere, so no boundary forms.
+        hexColors.set(numKey(1, 0), true);
+        updateBoundaryForColored(boundary, 1, 0, hexColors);
+        expect(boundary.size).toBe(0);
+        expect(setsEqual(boundary, getFrontiers(hexColors).boundary)).toBe(true);
+    });
+
+    it('returns the same set instance it was given (mutates in place)', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);
+        const boundary = getFrontiers(hexColors).boundary;
+        const returned = updateBoundaryForColored(boundary, 0, 0, hexColors);
+        expect(returned).toBe(boundary);
+    });
+
+    it('stays identical to a full getFrontiers rescan across a random battle', () => {
+        // Mirror the exact hex-vs-hex coloring loop: seed white + adjacent black,
+        // then repeatedly select the outermost/clockwise-most boundary cell, color
+        // it randomly, and maintain the boundary incrementally. After every step the
+        // incremental set must equal a fresh getFrontiers() rescan — this is what
+        // guarantees the live game's selection order (and outcome) is preserved.
+        // (These battles keep the boundary small; the region-fill test below is the
+        // large-boundary stress case. Keep both.)
+        let totalSteps = 0;
+        for (let seed = 1; seed <= 25; seed++) {
+            const rng = mulberry32(seed);
+            const hexColors = new Map();
+            hexColors.set(numKey(0, 0), true);   // White start
+            hexColors.set(numKey(1, 0), false);  // Black start (as in hexVsHexCheck)
+
+            const boundary = getFrontiers(hexColors).boundary;
+
+            for (let step = 0; step < 250 && boundary.size > 0; step++) {
+                expect(setsEqual(boundary, getFrontiers(hexColors).boundary)).toBe(true);
+
+                const nextKey = selectNextFrontierHex(boundary);
+                const { q, r } = decodeKey(nextKey);
+                hexColors.set(nextKey, rng() < 0.5);
+                updateBoundaryForColored(boundary, q, r, hexColors);
+                totalSteps++;
+            }
+
+            // ...and once more after the final coloring. (This post-loop check is
+            // what catches an incremental update that wrongly empties the boundary:
+            // the loop guard would exit early, but getFrontiers would still report
+            // the real cells, so the sets diverge here.)
+            expect(setsEqual(boundary, getFrontiers(hexColors).boundary)).toBe(true);
+        }
+        // Guard against the whole test silently degrading into a no-op (e.g. if the
+        // seed setup ever stopped producing a frontier): it must do real work.
+        expect(totalSteps).toBeGreaterThan(500);
+    });
+
+    it('matches getFrontiers when an entire region is filled in random order', () => {
+        // A stronger stress test than the battle above: color every cell of a
+        // radius-4 region in a seeded-random order with random colors. This drives
+        // the boundary through large, jagged configurations (sizes into the
+        // dozens) that the outermost-first battle never reaches, exercising both
+        // the add and the (single) remove branch of the incremental update.
+        for (let seed = 1; seed <= 30; seed++) {
+            const rng = mulberry32(seed);
+            const R = 4;
+            const cells = [];
+            for (let q = -R; q <= R; q++) {
+                for (let r = -R; r <= R; r++) {
+                    if (Math.abs(-q - r) <= R) cells.push([q, r]);
+                }
+            }
+            // Seeded Fisher-Yates shuffle.
+            for (let i = cells.length - 1; i > 0; i--) {
+                const j = Math.floor(rng() * (i + 1));
+                [cells[i], cells[j]] = [cells[j], cells[i]];
+            }
+
+            const hexColors = new Map();
+            const boundary = new Set();
+            for (const [q, r] of cells) {
+                hexColors.set(numKey(q, r), rng() < 0.5);
+                updateBoundaryForColored(boundary, q, r, hexColors);
+                expect(setsEqual(boundary, getFrontiers(hexColors).boundary)).toBe(true);
+            }
+        }
     });
 });
 

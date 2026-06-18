@@ -31,6 +31,7 @@ Exports:
 - `pixelToAxial(px, py, hexSize)` — Convert pixel to axial coordinates
 - `getTouchedColors(q, r, hexColors)` — What colors neighbor an untested hex
 - `getFrontiers(hexColors)` — Categorize untested hexes into boundary/white/black frontier
+- `updateBoundaryForColored(boundary, q, r, hexColors)` — Incrementally update a boundary set after one hex is colored (the hex-vs-hex loop's O(1)-per-step replacement for a full `getFrontiers` rescan)
 - `isHexTrapped(q, r, maxDist, hexColors)` — Can a hex's color region escape to open space?
 - `findEncircledPockets(hexColors)` — Find untested regions surrounded only by black
 - `sliderToSpeed(value)` / `speedToLabel(speed)` — Map the speed slider to a multiplier and its display label
@@ -46,7 +47,7 @@ A one-class module owning a monotonic generation counter. The escape/battle loop
 The main application file. Imports from `hex-core.js`, `run-tracker.js`, and `run-session.js`. Handles:
 - WebGL2 instanced rendering (hex geometry as triangle fan)
 - Canvas overlay for start hex marker
-- BFS game loops (`checkEncirclement`, `hexVsHexCheck`), cancellable via the shared `runSession`
+- BFS game loops (`checkEncirclement`, `hexVsHexCheck`), cancellable via the shared `runSession`. `hexVsHexCheck` seeds its boundary once with `getFrontiers` and then maintains it with `updateBoundaryForColored`, so the per-step cost stays O(1) in the boundary rather than O(N) in the whole board.
 - User interaction (click placement, pan, zoom, speed control)
 - Two `RunTracker` instances (`escapeTracker`, `hvhTracker`)
 
@@ -72,7 +73,7 @@ Coordinates are encoded as numeric keys via `numKey(q, r)` for fast Map lookups,
 ## Testing
 
 - Framework: Vitest (ES module native, no build step)
-- `tests/hex-core.test.js` — Pure logic tests (coordinate math, BFS, pocket detection)
+- `tests/hex-core.test.js` — Pure logic tests (coordinate math, BFS, pocket detection, incremental-boundary equivalence with `getFrontiers`)
 - `tests/run-tracker.test.js` — Run tracking with in-memory storage adapter
 - `tests/run-session.test.js` — Run cancellation token (begin/cancel/supersede semantics)
 - Run: `npm test`

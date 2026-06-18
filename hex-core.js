@@ -137,6 +137,39 @@ export function getFrontiers(hexColors) {
     return { boundary, whiteFrontier, blackFrontier };
 }
 
+// Incrementally update a boundary set after a single hex at (q, r) is colored.
+//
+// The hex-vs-hex loop colors one boundary cell per step and only needs the
+// `boundary` set (untested cells touching both colors). Re-deriving it with a
+// full getFrontiers() rescan every step is O(total colored cells); but coloring
+// one cell can only change the boundary status of that cell and its 6 immediate
+// neighbors — every other cell's neighborhood is untouched. So we re-evaluate
+// just those seven cells, turning an O(N) per-step rescan into O(1).
+//
+// Coloring is monotonic: it adds a color to the board, never removes one, so a
+// cell that already touched both colors still does. The only cell that can ever
+// LEAVE the boundary is the one just colored (it is no longer untested); every
+// other change is a cell newly touching both colors and thus joining. Given the
+// same board, this leaves `boundary` identical to getFrontiers(hexColors).boundary.
+// Mutates `boundary` in place and returns it.
+export function updateBoundaryForColored(boundary, q, r, hexColors) {
+    // The just-colored cell is no longer an untested boundary cell.
+    boundary.delete(numKey(q, r));
+
+    // Any untested neighbor that now touches both colors joins the boundary.
+    for (let i = 0; i < 6; i++) {
+        const nq = q + NEIGHBOR_OFFSETS[i][0];
+        const nr = r + NEIGHBOR_OFFSETS[i][1];
+        const nk = numKey(nq, nr);
+        if (hexColors.has(nk)) continue;
+
+        const { touchesWhite, touchesBlack } = getTouchedColors(nq, nr, hexColors);
+        if (touchesWhite && touchesBlack) boundary.add(nk);
+    }
+
+    return boundary;
+}
+
 // Check if a specific hex is trapped (can't reach distance D through untested hexes)
 export function isHexTrapped(startQ, startR, maxDist, hexColors) {
     const startKey = numKey(startQ, startR);

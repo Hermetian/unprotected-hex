@@ -5,7 +5,8 @@ import {
     CONFIG, NEIGHBOR_OFFSETS,
     numKey, decodeKey, hexDist, clockwiseAngle,
     selectNextFrontierHex, pixelToAxial,
-    getTouchedColors, getFrontiers, isHexTrapped, findEncircledPockets,
+    getTouchedColors, getFrontiers, updateBoundaryForColored,
+    isHexTrapped, findEncircledPockets,
     sliderToSpeed, speedToLabel, computePacing,
 } from './hex-core.js';
 import { RunTracker } from './run-tracker.js';
@@ -449,9 +450,14 @@ async function hexVsHexCheck(token) {
     let maxDistReached = 0;
     let lastRenderTime = performance.now();
 
-    while (true) {
-        const { boundary } = getFrontiers(hexColors);
+    // Seed the boundary once, then maintain it incrementally. Coloring one hex
+    // only changes the boundary status of that hex and its 6 neighbors, so a full
+    // getFrontiers() rescan every step is O(N²) wasted work over a whole battle.
+    // The incrementally-maintained set stays identical to a fresh rescan (proven
+    // in tests), so the selection order — and thus the outcome — is unchanged.
+    const { boundary } = getFrontiers(hexColors);
 
+    while (true) {
         // Only test boundary hexes - hexes that touch both colors
         // When boundary is empty, the colors have separated and outcome is determined
         if (boundary.size === 0) {
@@ -463,6 +469,10 @@ async function hexVsHexCheck(token) {
             break;
         }
 
+        // Frontier size BEFORE this step's coloring — drives pacing and the
+        // status readout, matching the old full-rescan semantics exactly.
+        const exposedCount = boundary.size;
+
         const { q, r } = decodeKey(nextKey);
 
         // Color it randomly
@@ -470,6 +480,8 @@ async function hexVsHexCheck(token) {
         hexColors.set(nextKey, isWhite);
         hexInstances.push({ q, r, color: isWhite ? 1 : 0 });
         instanceBufferDirty = true;
+        // Refresh the boundary in place for the next iteration (cheap, local).
+        updateBoundaryForColored(boundary, q, r, hexColors);
 
         const dist = hexDist(q, r);
         maxDistReached = Math.max(maxDistReached, dist);
@@ -500,13 +512,13 @@ async function hexVsHexCheck(token) {
         }
 
         // Rendering and delays
-        const { isMaxSpeed, delay, batchSize } = computePacing(boundary.size + 1, speedMultiplier);
+        const { isMaxSpeed, delay, batchSize } = computePacing(exposedCount + 1, speedMultiplier);
 
         if (isMaxSpeed) {
             if (stepCount % 1000 === 0) {
                 const now = performance.now();
                 if (now - lastRenderTime > 50) {
-                    statusDiv.textContent = `Distance: ${Math.round(maxDistReached)} | Boundary: ${boundary.size} | Hexes: ${hexInstances.length}`;
+                    statusDiv.textContent = `Distance: ${Math.round(maxDistReached)} | Boundary: ${exposedCount} | Hexes: ${hexInstances.length}`;
                     render();
                     lastRenderTime = now;
                 }
@@ -518,7 +530,7 @@ async function hexVsHexCheck(token) {
             if (stepCount % batchSize === 0) {
                 const now = performance.now();
                 if (now - lastRenderTime > 16) {
-                    statusDiv.textContent = `Distance: ${Math.round(maxDistReached)} | Boundary: ${boundary.size} | Hexes: ${hexInstances.length}`;
+                    statusDiv.textContent = `Distance: ${Math.round(maxDistReached)} | Boundary: ${exposedCount} | Hexes: ${hexInstances.length}`;
                     render();
                     lastRenderTime = now;
                 }

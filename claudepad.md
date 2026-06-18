@@ -1,5 +1,27 @@
 # Session Summaries
 
+## 2026-06-17T23:40Z — HvH perf: incremental boundary (O(N²) → O(N))
+- **Problem:** `hexVsHexCheck` in `hex.js` recomputed the *entire* frontier with `getFrontiers(hexColors)`
+  at the top of every loop iteration, then used only `boundary` (discarding the white/black frontiers).
+  `getFrontiers` scans all colored cells and allocates four Sets per call, so a battle that colors N
+  cells cost O(N²) just on frontier maintenance — the dominant per-step cost for large boards.
+- **Fix:** Added pure `updateBoundaryForColored(boundary, q, r, hexColors)` to `hex-core.js`. Coloring
+  one cell can only change the boundary status of that cell and its 6 neighbors (and coloring is
+  monotonic — it only *adds* colors, so the sole cell that can ever leave the boundary is the one just
+  colored). So the loop now seeds `boundary` once via `getFrontiers` and updates it in place each step.
+- **Behavior preserved exactly:** same boundary set each step ⇒ same `selectNextFrontierHex` ⇒ same cell
+  colored ⇒ same single `Math.random()` draw, same order. Pacing/status capture `exposedCount =
+  boundary.size` *before* the in-place update, matching the old full-rescan value byte-for-byte.
+- **Benchmark (boundary maintenance only):** 1.3k cells 190ms→1.5ms (127×); 4.9k 5.1s→4.9ms (1034×);
+  11k 30s→11.5ms (2643×). Quadratic→linear. (`isHexTrapped` ×2/step is now the next bottleneck — a
+  future opportunity; coloring white can only newly-trap black and vice-versa, so the two trap checks
+  per step could be halved by an invariant argument. Not done this pass — left as untested-outcome risk.)
+- **Tests:** +6 in `tests/hex-core.test.js` (75→81). Key one is a property test that mirrors the exact
+  HvH loop and asserts the incremental boundary equals a fresh `getFrontiers().boundary` at *every*
+  step over 25 seeds, plus a radius-4 region-fill stress test (boundaries up to size 28, both add/remove
+  branches). Reviewed via 3 finder sub-agents (3000+ seeds, zero mismatches); hardened the battle test
+  with a non-vacuity guard. Committed; not pushed (orchestrator pushes after its safety check).
+
 ## 2026-06-17T16:50Z — Fix reset-during-run race condition (cancellation tokens)
 - **Bug:** `reset()` (and mode-switch, which calls it) only flipped `isRunning = false` and cleared
   `hexColors`/`hexInstances`; it never signalled the in-flight async loop (`checkEncirclement` /
@@ -33,6 +55,15 @@
 
 # Key Findings
 
+- **Incremental-boundary invariant (HvH).** `hexVsHexCheck` keeps a single long-lived `boundary` Set
+  alive across the whole loop, maintained by `updateBoundaryForColored` instead of a per-step
+  `getFrontiers` rescan. This is only valid because each step colors exactly one *previously-untested*
+  cell (so coloring is monotonic — colors are added, never changed/removed). If the loop is ever
+  changed to recolor cells, flip colors, or remove hexes mid-run, the incremental invariant breaks and
+  the boundary must be reseeded (or `getFrontiers` used). `tests/hex-core.test.js` pins the equivalence
+  with a property test mirroring the exact loop — keep it. The next per-step bottleneck is the two
+  `isHexTrapped` calls (region floods); halving them via "coloring white can only newly-trap black" is
+  a known, un-done optimization (would change untested-outcome code, so deferred).
 - **Async-loop cancellation invariant.** The escape/battle loops in `hex.js` mutate shared module
   state (`hexColors`, `hexInstances`) and yield at `await sleep(...)`. Any new `await` added inside
   these loops (or in `startEscapeCheck`/`startHvhCheck` after a yield) MUST be followed by
