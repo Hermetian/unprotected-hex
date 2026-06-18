@@ -1,5 +1,31 @@
 # Session Summaries
 
+## 2026-06-18T06:00Z — Extract HvH battle into a pure, tested stepper
+- **What:** The hex-vs-hex battle loop used to live inline in `hex.js`'s `hexVsHexCheck`,
+  mixing the simulation (select boundary cell → color → maintain boundary → trap-check →
+  decide winner) with WebGL/pacing/cancellation. Battle *outcomes* had **zero** test
+  coverage, and the win-determination logic was duplicated (in-loop + post-loop).
+- **Change:** Added pure `determineBattleWinner`, `createBattle`, `stepBattle` to `hex-core.js`.
+  `hexVsHexCheck` is now a thin driver: it calls `stepBattle(sim, Math.random)`, mirrors the
+  returned `sim.colored` cell into the GPU buffer, and keeps the render/pacing/cancellation
+  skeleton byte-for-byte (same `await sleep` + `runSession.isCurrent(token)` checks, same
+  `computePacing(exposedCount+1, …)`, same status text). Removed 8 now-unused imports from
+  `hex.js` (incl. 2 that were already dead: `clockwiseAngle`, `getTouchedColors`).
+- **Behavior preserved exactly:** verified by a faithful re-implementation of the *original*
+  loop vs the new stepper over 180 battles (3 escape distances × 60 seeds) — **0 mismatches**
+  on winner, distance, AND full colored sequence; outcomes spanned white/black/unresolved.
+  Escape mode (`checkEncirclement`) left inline on purpose (its per-neighbor pacing would
+  change animation cadence if extracted — outcome-neutral but unverifiable here).
+- **Tests:** +14 in `tests/hex-core.test.js` (81→95). `determineBattleWinner` all four
+  cases; `stepBattle` determinism, boundary-invariant through the real stepper, both
+  win directions (forced rng), distance-cap draw, pre-sealed immediate resolution, done
+  no-op. `createBattle` takes an optional `escapeDistance` (default = real radius) so the
+  cap branch is testable; guarded so a non-positive/NaN value falls back to the default.
+- **Review:** 3 finder sub-agents (correctness / JS-pitfalls / test-quality). Correctness =
+  faithful (independently cross-checked 150 seeds, 0 mismatches). Fixed 2 minor findings:
+  the `escapeDistance` 0/NaN footgun (added the guard + a test) and strengthened the
+  done-no-op test to snapshot every field. Committed; not pushed.
+
 ## 2026-06-17T23:40Z — HvH perf: incremental boundary (O(N²) → O(N))
 - **Problem:** `hexVsHexCheck` in `hex.js` recomputed the *entire* frontier with `getFrontiers(hexColors)`
   at the top of every loop iteration, then used only `boundary` (discarding the white/black frontiers).
@@ -55,15 +81,28 @@
 
 # Key Findings
 
-- **Incremental-boundary invariant (HvH).** `hexVsHexCheck` keeps a single long-lived `boundary` Set
-  alive across the whole loop, maintained by `updateBoundaryForColored` instead of a per-step
-  `getFrontiers` rescan. This is only valid because each step colors exactly one *previously-untested*
-  cell (so coloring is monotonic — colors are added, never changed/removed). If the loop is ever
-  changed to recolor cells, flip colors, or remove hexes mid-run, the incremental invariant breaks and
-  the boundary must be reseeded (or `getFrontiers` used). `tests/hex-core.test.js` pins the equivalence
-  with a property test mirroring the exact loop — keep it. The next per-step bottleneck is the two
-  `isHexTrapped` calls (region floods); halving them via "coloring white can only newly-trap black" is
-  a known, un-done optimization (would change untested-outcome code, so deferred).
+- **HvH battle is now a pure stepper.** As of 2026-06-18 the battle simulation lives in
+  `createBattle`/`stepBattle`/`determineBattleWinner` in `hex-core.js`; `hexVsHexCheck` in `hex.js`
+  only drives it (GPU push + pacing + render + cancellation). The boundary is still seeded once and
+  maintained by `updateBoundaryForColored` (the incremental invariant below), now *inside* `stepBattle`.
+- **Incremental-boundary invariant (HvH).** The `boundary` Set is maintained by `updateBoundaryForColored`
+  instead of a per-step `getFrontiers` rescan. This is only valid because each step colors exactly one
+  *previously-untested* cell (coloring is monotonic — colors are added, never changed/removed). If the
+  loop is ever changed to recolor cells, flip colors, or remove hexes mid-run, the incremental invariant
+  breaks and the boundary must be reseeded. `tests/hex-core.test.js` pins the equivalence both with a
+  standalone property test and through the real `stepBattle` path — keep both.
+- **Why the two-`isHexTrapped`-per-step halving is STILL deferred (precise reason found 2026-06-18).**
+  The idea: since coloring a cell extends that color's region and can only seal the *opponent*, "coloring
+  white can newly-trap black but never white" (and vice-versa), so carry the same-colored side forward
+  and recompute only the opponent → one flood/step instead of two. This is exact **only for the true trap
+  predicate**. But `isHexTrapped` has a `MAX_UNTESTED_SEARCH` (=10000) cap that returns `false` (not
+  trapped) once the reachable untested region hits 10000 cells. Coloring white *shrinks* white's reachable
+  untested cavity by exactly one cell, so at the cap boundary (a bounded cavity of exactly ~10000 cells)
+  coloring white can flip white from not-trapped→trapped under the *capped* predicate — diverging from the
+  naive recompute and changing the winner. Astronomically unlikely in a 2-seed battle at p≈0.5, but
+  non-zero, so it stays deferred. The new pure `stepBattle` makes it *safely landable later*: add a
+  property test running an optimized stepper vs the current one over many seeds (it'll match outside the
+  cap-boundary pathology), and either accept the documented caveat or raise/remove the cap first.
 - **Async-loop cancellation invariant.** The escape/battle loops in `hex.js` mutate shared module
   state (`hexColors`, `hexInstances`) and yield at `await sleep(...)`. Any new `await` added inside
   these loops (or in `startEscapeCheck`/`startHvhCheck` after a yield) MUST be followed by

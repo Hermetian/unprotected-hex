@@ -34,6 +34,8 @@ Exports:
 - `updateBoundaryForColored(boundary, q, r, hexColors)` — Incrementally update a boundary set after one hex is colored (the hex-vs-hex loop's O(1)-per-step replacement for a full `getFrontiers` rescan)
 - `isHexTrapped(q, r, maxDist, hexColors)` — Can a hex's color region escape to open space?
 - `findEncircledPockets(hexColors)` — Find untested regions surrounded only by black
+- `determineBattleWinner(whiteStart, blackStart, maxDist, hexColors)` — Decide a hex-vs-hex outcome (`'white'`/`'black'`/`'unresolved'`), or `null` if still undecided
+- `createBattle(whiteStart, blackStart, hexColors, escapeDistance?)` / `stepBattle(sim, rng)` — Pure hex-vs-hex simulation: `createBattle` seeds the state (boundary, trackers); `stepBattle` advances it one cell using an injected RNG, owning all win/draw logic. `hex.js` drives these and handles only the GPU/render/pacing side effects.
 - `sliderToSpeed(value)` / `speedToLabel(speed)` — Map the speed slider to a multiplier and its display label
 - `computePacing(count, speedMultiplier)` — Per-step animation pacing (batch size + delay) from the live frontier size
 
@@ -47,7 +49,9 @@ A one-class module owning a monotonic generation counter. The escape/battle loop
 The main application file. Imports from `hex-core.js`, `run-tracker.js`, and `run-session.js`. Handles:
 - WebGL2 instanced rendering (hex geometry as triangle fan)
 - Canvas overlay for start hex marker
-- BFS game loops (`checkEncirclement`, `hexVsHexCheck`), cancellable via the shared `runSession`. `hexVsHexCheck` seeds its boundary once with `getFrontiers` and then maintains it with `updateBoundaryForColored`, so the per-step cost stays O(1) in the boundary rather than O(N) in the whole board.
+- Game loops cancellable via the shared `runSession`:
+  - `checkEncirclement` — the escape-mode BFS (still inline, since its lazy random coloring is interleaved with GPU pushes).
+  - `hexVsHexCheck` — a thin driver over the pure `createBattle`/`stepBattle` in `hex-core.js`. The simulation (cell selection, coloring, incremental boundary maintenance, win/draw detection) lives in the core and is unit-tested; the driver only mirrors each colored cell into the GPU buffer and handles pacing, rendering, and cancellation. The boundary is seeded once and maintained with `updateBoundaryForColored`, so per-step cost stays O(1) in the boundary rather than O(N) in the whole board.
 - User interaction (click placement, pan, zoom, speed control)
 - Two `RunTracker` instances (`escapeTracker`, `hvhTracker`)
 
@@ -73,7 +77,7 @@ Coordinates are encoded as numeric keys via `numKey(q, r)` for fast Map lookups,
 ## Testing
 
 - Framework: Vitest (ES module native, no build step)
-- `tests/hex-core.test.js` — Pure logic tests (coordinate math, BFS, pocket detection, incremental-boundary equivalence with `getFrontiers`)
+- `tests/hex-core.test.js` — Pure logic tests (coordinate math, BFS, pocket detection, incremental-boundary equivalence with `getFrontiers`, and hex-vs-hex battle outcomes via `determineBattleWinner`/`stepBattle`)
 - `tests/run-tracker.test.js` — Run tracking with in-memory storage adapter
 - `tests/run-session.test.js` — Run cancellation token (begin/cancel/supersede semantics)
 - Run: `npm test`

@@ -5,6 +5,7 @@ import {
     selectNextFrontierHex, pixelToAxial,
     getTouchedColors, getFrontiers, updateBoundaryForColored,
     isHexTrapped, findEncircledPockets,
+    determineBattleWinner, createBattle, stepBattle,
     sliderToSpeed, speedToLabel, computePacing,
 } from '../hex-core.js';
 
@@ -546,6 +547,201 @@ describe('findEncircledPockets', () => {
         // The only black-enclosed untested region is the 2-cell interior.
         // (The outer untested plane is unbounded and exceeds MAX_POCKET_SIZE.)
         expect(pockets).toEqual([2]);
+    });
+});
+
+// --- determineBattleWinner ---
+
+describe('determineBattleWinner', () => {
+    // White at origin, sealed by black on all six neighbours. The black ring itself
+    // has open space outside it, so any black start on the ring is NOT trapped.
+    function whiteSealedByBlack() {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);
+        for (const [dq, dr] of NEIGHBOR_OFFSETS) hexColors.set(numKey(dq, dr), false);
+        return hexColors;
+    }
+
+    it('returns null while both starts can still escape (open board)', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);
+        hexColors.set(numKey(1, 0), false);
+        expect(determineBattleWinner({ q: 0, r: 0 }, { q: 1, r: 0 }, CONFIG.ESCAPE_DISTANCE, hexColors)).toBeNull();
+    });
+
+    it('black wins when white is sealed and black is open', () => {
+        const hexColors = whiteSealedByBlack();
+        expect(determineBattleWinner({ q: 0, r: 0 }, { q: 1, r: 0 }, CONFIG.ESCAPE_DISTANCE, hexColors)).toBe('black');
+    });
+
+    it('white wins when black is sealed and white is open (mirror image)', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), false);
+        for (const [dq, dr] of NEIGHBOR_OFFSETS) hexColors.set(numKey(dq, dr), true);
+        expect(determineBattleWinner({ q: 1, r: 0 }, { q: 0, r: 0 }, CONFIG.ESCAPE_DISTANCE, hexColors)).toBe('white');
+    });
+
+    it('is unresolved when both starts are sealed in separate cavities', () => {
+        const hexColors = whiteSealedByBlack();
+        // A second, far-away cavity: black sealed by white (no overlap with the first).
+        const bq = 20, br = 0;
+        hexColors.set(numKey(bq, br), false);
+        for (const [dq, dr] of NEIGHBOR_OFFSETS) hexColors.set(numKey(bq + dq, br + dr), true);
+        expect(determineBattleWinner({ q: 0, r: 0 }, { q: bq, r: br }, CONFIG.ESCAPE_DISTANCE, hexColors)).toBe('unresolved');
+    });
+});
+
+// --- createBattle / stepBattle ---
+
+describe('createBattle / stepBattle', () => {
+    // The standard opening: white at the origin, black one cell East (as placed by
+    // handleClick in the live game).
+    function openingBoard() {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);
+        hexColors.set(numKey(1, 0), false);
+        return hexColors;
+    }
+
+    it('seeds the boundary from the opening position', () => {
+        const sim = createBattle({ q: 0, r: 0 }, { q: 1, r: 0 }, openingBoard());
+        expect(setsEqual(sim.boundary, getFrontiers(sim.hexColors).boundary)).toBe(true);
+        expect(sim.boundary.size).toBeGreaterThan(0);
+        expect(sim.done).toBe(false);
+    });
+
+    it('is deterministic: equal rng draws ⇒ identical colored sequence and result', () => {
+        const run = () => {
+            const rng = mulberry32(12345);
+            const sim = createBattle({ q: 0, r: 0 }, { q: 1, r: 0 }, openingBoard());
+            const colored = [];
+            for (let i = 0; i < 40 && !sim.done; i++) {
+                stepBattle(sim, rng);
+                if (sim.colored) colored.push(`${sim.colored.q},${sim.colored.r},${sim.colored.isWhite}`);
+            }
+            return { colored, done: sim.done, winner: sim.winner, maxDist: sim.maxDistReached };
+        };
+        const a = run();
+        const b = run();
+        expect(a).toEqual(b);
+        expect(a.colored.length).toBeGreaterThan(0);   // non-vacuous: it really stepped
+    });
+
+    it('captures the pre-coloring boundary size in exposedCount', () => {
+        const sim = createBattle({ q: 0, r: 0 }, { q: 1, r: 0 }, openingBoard());
+        const before = sim.boundary.size;
+        stepBattle(sim, () => 0.25);
+        expect(sim.exposedCount).toBe(before);   // size BEFORE the step's coloring
+    });
+
+    it('keeps its boundary identical to a fresh getFrontiers rescan at every step', () => {
+        // Drive the real stepper — which also runs the per-step trap checks — and
+        // verify the incrementally-maintained boundary never drifts from a full
+        // rescan. A small escape distance (20, far above the ~10 these short runs
+        // reach) bounds each isHexTrapped flood without ending the battle early.
+        let totalSteps = 0;
+        for (let seed = 1; seed <= 6; seed++) {
+            const rng = mulberry32(seed);
+            const sim = createBattle({ q: 0, r: 0 }, { q: 1, r: 0 }, openingBoard(), 20);
+            for (let i = 0; i < 25 && !sim.done; i++) {
+                stepBattle(sim, rng);
+                expect(setsEqual(sim.boundary, getFrontiers(sim.hexColors).boundary)).toBe(true);
+                totalSteps++;
+            }
+        }
+        expect(totalSteps).toBeGreaterThan(100);
+    });
+
+    it('resolves immediately when a start is already sealed (empty boundary)', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);
+        for (const [dq, dr] of NEIGHBOR_OFFSETS) hexColors.set(numKey(dq, dr), false);
+        const sim = createBattle({ q: 0, r: 0 }, { q: 1, r: 0 }, hexColors);
+        expect(sim.boundary.size).toBe(0);     // nothing touches both colors
+        stepBattle(sim, () => 0.5);
+        expect(sim.done).toBe(true);
+        expect(sim.colored).toBeNull();        // no cell was colored
+        expect(sim.winner).toBe('black');
+    });
+
+    it('seals the loser during play and reports the win (black wins)', () => {
+        // White at origin with five black neighbours; (0,1) is the lone gap and thus
+        // the only boundary cell. Forcing it black surrounds white → black wins in one step.
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);
+        for (const [dq, dr] of NEIGHBOR_OFFSETS) {
+            if (!(dq === 0 && dr === 1)) hexColors.set(numKey(dq, dr), false);
+        }
+        const sim = createBattle({ q: 0, r: 0 }, { q: 1, r: 0 }, hexColors);
+        expect(sim.boundary.size).toBe(1);
+        expect(sim.boundary.has(numKey(0, 1))).toBe(true);
+        stepBattle(sim, () => 0.9);   // ≥ 0.5 ⇒ colors black ⇒ seals white
+        expect(sim.colored).toEqual({ q: 0, r: 1, isWhite: false });
+        expect(sim.done).toBe(true);
+        expect(sim.winner).toBe('black');
+    });
+
+    it('seals the loser during play and reports the win (white wins, mirror)', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), false);   // black start at origin
+        for (const [dq, dr] of NEIGHBOR_OFFSETS) {
+            if (!(dq === 0 && dr === 1)) hexColors.set(numKey(dq, dr), true);
+        }
+        const sim = createBattle({ q: 1, r: 0 }, { q: 0, r: 0 }, hexColors);
+        expect(sim.boundary.size).toBe(1);
+        stepBattle(sim, () => 0.1);   // < 0.5 ⇒ colors white ⇒ seals black
+        expect(sim.colored).toEqual({ q: 0, r: 1, isWhite: true });
+        expect(sim.done).toBe(true);
+        expect(sim.winner).toBe('white');
+    });
+
+    it('ends as unresolved once a colored cell reaches the escape distance', () => {
+        // Place the duel far from the origin (white at (5,0), black at (6,0)) and set a
+        // tiny escape distance of 3. Their shared boundary cells already sit at distance
+        // 6, so the very first coloring trips the distance cap — a draw, decided before
+        // any trap check. (The distance branch is checked before the trap branch.)
+        const hexColors = new Map();
+        hexColors.set(numKey(5, 0), true);
+        hexColors.set(numKey(6, 0), false);
+        const sim = createBattle({ q: 5, r: 0 }, { q: 6, r: 0 }, hexColors, 3);
+        stepBattle(sim, () => 0.5);
+        expect(sim.done).toBe(true);
+        expect(sim.winner).toBe('unresolved');
+        expect(sim.maxDistReached).toBeGreaterThanOrEqual(3);
+    });
+
+    it('is a no-op once the battle is done', () => {
+        const hexColors = new Map();
+        hexColors.set(numKey(0, 0), true);
+        for (const [dq, dr] of NEIGHBOR_OFFSETS) hexColors.set(numKey(dq, dr), false);
+        const sim = createBattle({ q: 0, r: 0 }, { q: 1, r: 0 }, hexColors);
+        stepBattle(sim, () => 0.5);
+        expect(sim.done).toBe(true);
+        // Snapshot every mutable field so an errant later step can't slip through
+        // (e.g. an in-place recolor that leaves hexColors.size unchanged).
+        const snapshot = {
+            winner: sim.winner, colored: sim.colored, done: sim.done,
+            maxDist: sim.maxDistReached, boundarySize: sim.boundary.size,
+            hexSize: sim.hexColors.size,
+        };
+        const result = stepBattle(sim, () => 0.5);   // must not advance anything
+        expect(result).toBe(sim);                    // returns the same sim
+        expect({
+            winner: sim.winner, colored: sim.colored, done: sim.done,
+            maxDist: sim.maxDistReached, boundarySize: sim.boundary.size,
+            hexSize: sim.hexColors.size,
+        }).toEqual(snapshot);
+    });
+
+    it('falls back to the default escape distance for a non-positive or non-finite value', () => {
+        // The escapeDistance param is test-facing; guard the degenerate values that
+        // would otherwise make every battle resolve instantly or corrupt trap floods.
+        for (const bad of [0, -5, NaN]) {
+            expect(createBattle({ q: 0, r: 0 }, { q: 1, r: 0 }, openingBoard(), bad).escapeDistance)
+                .toBe(CONFIG.ESCAPE_DISTANCE);
+        }
+        // A sensible positive value is kept as-is.
+        expect(createBattle({ q: 0, r: 0 }, { q: 1, r: 0 }, openingBoard(), 3).escapeDistance).toBe(3);
     });
 });
 

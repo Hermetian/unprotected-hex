@@ -326,6 +326,105 @@ export function findEncircledPockets(hexColors) {
     return pocketSizes;
 }
 
+// --- Hex-vs-Hex battle (pure simulation) ---
+// The battle's *outcome* (who wins, at what distance) is decided entirely by the
+// coloring sequence and the trap checks — none of it needs the DOM or WebGL. These
+// functions own that logic so it is unit-testable; hex.js drives them and handles
+// only the side effects (pushing geometry to the GPU, pacing, rendering).
+
+// Decide the battle outcome from the current board, or return null if undecided.
+// A start hex loses once it is completely sealed off from open space by the
+// opponent (see isHexTrapped). Used both per-step (null ⇒ keep playing) and at the
+// end when the colors have separated (callers treat null there as a draw).
+export function determineBattleWinner(whiteStart, blackStart, maxDist, hexColors) {
+    const whiteTrapped = isHexTrapped(whiteStart.q, whiteStart.r, maxDist, hexColors);
+    const blackTrapped = isHexTrapped(blackStart.q, blackStart.r, maxDist, hexColors);
+    if (whiteTrapped && !blackTrapped) return 'black';
+    if (blackTrapped && !whiteTrapped) return 'white';
+    if (whiteTrapped && blackTrapped) return 'unresolved';
+    return null;
+}
+
+// Create the mutable state for a hex-vs-hex battle. `hexColors` must already hold
+// the two adjacent start hexes (white at whiteStart, black at blackStart); it is
+// mutated in place as the battle colors cells. The boundary (untested cells
+// touching both colors) is seeded once and then maintained incrementally by
+// stepBattle — see updateBoundaryForColored for why that stays exact. The battle
+// is declared an unresolved draw once a colored cell reaches `escapeDistance` from
+// the origin (defaults to the game's escape radius; a smaller positive value is
+// handy in tests). A non-positive or non-finite escapeDistance is meaningless — it
+// would make every battle resolve instantly (or, for NaN, corrupt the trap floods,
+// since `hexDist >= NaN` is always false) — so it falls back to the default.
+export function createBattle(whiteStart, blackStart, hexColors, escapeDistance = CONFIG.ESCAPE_DISTANCE) {
+    if (!(escapeDistance > 0)) escapeDistance = CONFIG.ESCAPE_DISTANCE;
+    return {
+        whiteStart,
+        blackStart,
+        hexColors,
+        escapeDistance,
+        boundary: getFrontiers(hexColors).boundary,
+        maxDistReached: 0,
+        // Per-step scratch the driver reads after each step():
+        exposedCount: 0,           // boundary size BEFORE this step (drives pacing/status)
+        colored: null,             // { q, r, isWhite } colored this step, or null
+        // Terminal state:
+        winner: null,              // 'white' | 'black' | 'unresolved' once done
+        done: false,
+    };
+}
+
+// Advance a battle by one cell, mutating `sim` (and its hexColors/boundary). `rng`
+// is a function returning a float in [0, 1) — inject Math.random in the app, a
+// seeded PRNG in tests. After the call:
+//   - sim.colored is the cell colored this step (null if none — boundary was empty)
+//   - sim.exposedCount is the boundary size *before* this step's coloring
+//   - sim.done / sim.winner are set once the outcome is decided
+// The selection→color→win-check order matches the original in-place loop exactly,
+// so given the same rng draws the outcome is identical.
+export function stepBattle(sim, rng) {
+    if (sim.done) return sim;
+    const { boundary, hexColors, whiteStart, blackStart, escapeDistance } = sim;
+
+    // Boundary exhausted (empty, or — defensively — no selectable cell): the colors
+    // have separated, so the battle is over. A decisive trap wins; otherwise
+    // (neither start sealed) it's a draw.
+    const nextKey = selectNextFrontierHex(boundary);
+    if (nextKey === null) {
+        sim.exposedCount = boundary.size;
+        sim.colored = null;
+        sim.winner = determineBattleWinner(whiteStart, blackStart, escapeDistance, hexColors) || 'unresolved';
+        sim.done = true;
+        return sim;
+    }
+
+    // Frontier size BEFORE coloring — drives the driver's pacing and status line.
+    sim.exposedCount = boundary.size;
+
+    const { q, r } = decodeKey(nextKey);
+    const isWhite = rng() < 0.5;
+    hexColors.set(nextKey, isWhite);
+    updateBoundaryForColored(boundary, q, r, hexColors);
+    sim.colored = { q, r, isWhite };
+
+    const dist = hexDist(q, r);
+    if (dist > sim.maxDistReached) sim.maxDistReached = dist;
+
+    // Ran past the escape radius without anyone being sealed in — call it a draw.
+    if (sim.maxDistReached >= escapeDistance) {
+        sim.winner = 'unresolved';
+        sim.done = true;
+        return sim;
+    }
+
+    // A start now fully surrounded by the opponent loses.
+    const winner = determineBattleWinner(whiteStart, blackStart, escapeDistance, hexColors);
+    if (winner) {
+        sim.winner = winner;
+        sim.done = true;
+    }
+    return sim;
+}
+
 // --- Animation pacing (pure) ---
 // These drive how fast the BFS/boundary loops animate. Kept here, free of DOM
 // state, so the speed mapping and per-step throttling are independently testable.

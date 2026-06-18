@@ -3,10 +3,8 @@
 
 import {
     CONFIG, NEIGHBOR_OFFSETS,
-    numKey, decodeKey, hexDist, clockwiseAngle,
-    selectNextFrontierHex, pixelToAxial,
-    getTouchedColors, getFrontiers, updateBoundaryForColored,
-    isHexTrapped, findEncircledPockets,
+    numKey, pixelToAxial,
+    createBattle, stepBattle, findEncircledPockets,
     sliderToSpeed, speedToLabel, computePacing,
 } from './hex-core.js';
 import { RunTracker } from './run-tracker.js';
@@ -438,87 +436,47 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Main hex vs hex check loop
+// Main hex vs hex check loop. The simulation itself (cell selection, coloring,
+// boundary maintenance, win detection) lives in the pure stepBattle/createBattle
+// in hex-core.js and is unit-tested there; this driver only mirrors each colored
+// cell into the GPU buffer and handles pacing, rendering, and cancellation.
 async function hexVsHexCheck(token) {
-    // Track the original starting positions
-    const whiteStartQ = startHex.q;
-    const whiteStartR = startHex.r;
-    const blackStartQ = startHex.q + 1;
-    const blackStartR = startHex.r;
+    // Capture the start positions up front so a later startHex mutation can't move
+    // the goalposts mid-battle (the black hex is placed one cell East — see handleClick).
+    const whiteStart = { q: startHex.q, r: startHex.r };
+    const blackStart = { q: startHex.q + 1, r: startHex.r };
+    const sim = createBattle(whiteStart, blackStart, hexColors);
 
     let stepCount = 0;
-    let maxDistReached = 0;
     let lastRenderTime = performance.now();
 
-    // Seed the boundary once, then maintain it incrementally. Coloring one hex
-    // only changes the boundary status of that hex and its 6 neighbors, so a full
-    // getFrontiers() rescan every step is O(N²) wasted work over a whole battle.
-    // The incrementally-maintained set stays identical to a fresh rescan (proven
-    // in tests), so the selection order — and thus the outcome — is unchanged.
-    const { boundary } = getFrontiers(hexColors);
+    while (!sim.done) {
+        stepBattle(sim, Math.random);
 
-    while (true) {
-        // Only test boundary hexes - hexes that touch both colors
-        // When boundary is empty, the colors have separated and outcome is determined
-        if (boundary.size === 0) {
-            break;
+        // Mirror the freshly-colored cell into the GPU instance buffer.
+        if (sim.colored) {
+            const { q, r, isWhite } = sim.colored;
+            hexInstances.push({ q, r, color: isWhite ? 1 : 0 });
+            instanceBufferDirty = true;
         }
 
-        const nextKey = selectNextFrontierHex(boundary);
-        if (nextKey === null) {
-            break;
-        }
-
-        // Frontier size BEFORE this step's coloring — drives pacing and the
-        // status readout, matching the old full-rescan semantics exactly.
-        const exposedCount = boundary.size;
-
-        const { q, r } = decodeKey(nextKey);
-
-        // Color it randomly
-        const isWhite = Math.random() < 0.5;
-        hexColors.set(nextKey, isWhite);
-        hexInstances.push({ q, r, color: isWhite ? 1 : 0 });
-        instanceBufferDirty = true;
-        // Refresh the boundary in place for the next iteration (cheap, local).
-        updateBoundaryForColored(boundary, q, r, hexColors);
-
-        const dist = hexDist(q, r);
-        maxDistReached = Math.max(maxDistReached, dist);
-        currentMaxDist = maxDistReached;
+        currentMaxDist = sim.maxDistReached;
         stepCount++;
 
-        // Check distance limit
-        if (maxDistReached >= CONFIG.ESCAPE_DISTANCE) {
-            render();
-            return { winner: 'unresolved', distance: maxDistReached };
-        }
+        // Decided (a trap, the distance cap, or the colors separating) — render the
+        // final board once below and report the result.
+        if (sim.done) break;
 
-        // Check win conditions after every hex - check if ORIGINAL hexes are trapped
-        const whiteTrapped = isHexTrapped(whiteStartQ, whiteStartR, CONFIG.ESCAPE_DISTANCE, hexColors);
-        const blackTrapped = isHexTrapped(blackStartQ, blackStartR, CONFIG.ESCAPE_DISTANCE, hexColors);
-
-        if (whiteTrapped && !blackTrapped) {
-            render();
-            return { winner: 'black', distance: maxDistReached };
-        }
-        if (blackTrapped && !whiteTrapped) {
-            render();
-            return { winner: 'white', distance: maxDistReached };
-        }
-        if (whiteTrapped && blackTrapped) {
-            render();
-            return { winner: 'unresolved', distance: maxDistReached };
-        }
-
-        // Rendering and delays
+        // Frontier size BEFORE this step's coloring — drives pacing and the status
+        // readout (the pure stepper captured it for us).
+        const exposedCount = sim.exposedCount;
         const { isMaxSpeed, delay, batchSize } = computePacing(exposedCount + 1, speedMultiplier);
 
         if (isMaxSpeed) {
             if (stepCount % 1000 === 0) {
                 const now = performance.now();
                 if (now - lastRenderTime > 50) {
-                    statusDiv.textContent = `Distance: ${Math.round(maxDistReached)} | Boundary: ${exposedCount} | Hexes: ${hexInstances.length}`;
+                    statusDiv.textContent = `Distance: ${Math.round(sim.maxDistReached)} | Boundary: ${exposedCount} | Hexes: ${hexInstances.length}`;
                     render();
                     lastRenderTime = now;
                 }
@@ -530,7 +488,7 @@ async function hexVsHexCheck(token) {
             if (stepCount % batchSize === 0) {
                 const now = performance.now();
                 if (now - lastRenderTime > 16) {
-                    statusDiv.textContent = `Distance: ${Math.round(maxDistReached)} | Boundary: ${exposedCount} | Hexes: ${hexInstances.length}`;
+                    statusDiv.textContent = `Distance: ${Math.round(sim.maxDistReached)} | Boundary: ${exposedCount} | Hexes: ${hexInstances.length}`;
                     render();
                     lastRenderTime = now;
                 }
@@ -542,14 +500,8 @@ async function hexVsHexCheck(token) {
         }
     }
 
-    // Frontier exhausted - check final state
     render();
-    const whiteTrapped = isHexTrapped(startHex.q, startHex.r, CONFIG.ESCAPE_DISTANCE, hexColors);
-    const blackTrapped = isHexTrapped(startHex.q + 1, startHex.r, CONFIG.ESCAPE_DISTANCE, hexColors);
-
-    if (whiteTrapped && !blackTrapped) return { winner: 'black', distance: maxDistReached };
-    if (blackTrapped && !whiteTrapped) return { winner: 'white', distance: maxDistReached };
-    return { winner: 'unresolved', distance: maxDistReached };
+    return { winner: sim.winner, distance: sim.maxDistReached };
 }
 
 // Event handlers
