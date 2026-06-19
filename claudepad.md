@@ -1,5 +1,42 @@
 # Session Summaries
 
+## 2026-06-19T06:59Z — Extract escape-mode BFS into a pure, tested stepper
+- **What:** Escape mode (`checkEncirclement`) was the last big chunk of game logic still
+  living inline in `hex.js`, with **zero** direct outcome coverage — the exact state the
+  HvH battle was in before commit d25c9b2. All escape tests were for helpers
+  (`isHexTrapped`, `findEncircledPockets`, `getFrontiers`), never the escaped/encircled
+  decision itself.
+- **Change:** Added pure `createEscape`/`stepEscape` to `hex-core.js` (mirrors
+  `createBattle`/`stepBattle`). `stepEscape` processes one BFS node: lazily colors the
+  node's not-yet-visited neighbors via an injected rng (50/50, one draw each, in
+  `NEIGHBOR_OFFSETS` order), enqueues the white ones, and owns the escaped (a dequeued
+  cell hits `escapeDistance`) / encircled (queue drains) decision. `checkEncirclement`
+  is now a thin driver: it iterates `sim.colored`, mirrors each cell to the GPU buffer,
+  and keeps the **original per-neighbor pacing exactly** (`stepCount` ticks once per
+  colored cell; pacing computed once per node; same render/sleep thresholds; same
+  `runSession.isCurrent(token)` cancellation guards). Removed the now-dead `getHexColor`
+  and the `NEIGHBOR_OFFSETS` import from `hex.js`.
+- **Behavior preserved exactly:** the status line reads identically — `visitedCount`
+  (start cell + 1 per colored cell) equals the old `visited.size` at every render point,
+  because in a real run every visited neighbor is freshly colored. Pinned by a
+  faithful-reimplementation equivalence test: a DOM-free copy of the *original* inline
+  BFS vs the new stepper over **180 runs** (3 escape distances × 60 seeds) — identical
+  escaped/distance/**full colored sequence**/final board, with both outcomes exercised
+  (non-vacuity asserted).
+- **Tests:** +11 in `tests/hex-core.test.js` (95→106). Determinism, neighbor-order +
+  one-draw-per-cell, all-white escape, all-black immediate encirclement, lazy-coloring
+  of a seeded cell, the 180-run equivalence sweep, `maxDistReached` tracking, terminal
+  step colors nothing, done no-op, and the `escapeDistance` guard.
+- **Review (high effort, 4 finder angles + verify + sweep):** correctness and
+  behavior-preservation both came back clean. Acted on the cleanup findings: (1) tightened
+  the `escapeDistance` guard in **both** `createEscape` *and* `createBattle` from
+  `!(x > 0)` to `!Number.isFinite(x) || x <= 0` — the old guard let `+Infinity` through,
+  contradicting both docstrings' "non-finite falls back" claim (a latent code/doc mismatch
+  in the already-shipped `createBattle`); added ±Infinity to both guard tests. (2) Dropped
+  the redundant `sim.nodeDist` field (provably equals `sim.maxDistReached` since BFS
+  dequeues in nondecreasing distance order) — the driver now reads `maxDistReached` for its
+  status line, matching the HvH driver and `createBattle`'s leaner shape. Committed; not pushed.
+
 ## 2026-06-18T06:00Z — Extract HvH battle into a pure, tested stepper
 - **What:** The hex-vs-hex battle loop used to live inline in `hex.js`'s `hexVsHexCheck`,
   mixing the simulation (select boundary cell → color → maintain boundary → trap-check →
@@ -81,10 +118,25 @@
 
 # Key Findings
 
-- **HvH battle is now a pure stepper.** As of 2026-06-18 the battle simulation lives in
-  `createBattle`/`stepBattle`/`determineBattleWinner` in `hex-core.js`; `hexVsHexCheck` in `hex.js`
-  only drives it (GPU push + pacing + render + cancellation). The boundary is still seeded once and
-  maintained by `updateBoundaryForColored` (the incremental invariant below), now *inside* `stepBattle`.
+- **Both game modes are now pure steppers.** As of 2026-06-18 the HvH battle lives in
+  `createBattle`/`stepBattle`/`determineBattleWinner`; as of 2026-06-19 escape mode lives in
+  `createEscape`/`stepEscape` — both in `hex-core.js`. `hexVsHexCheck` and `checkEncirclement` in
+  `hex.js` are now *only* drivers (GPU push + pacing + render + cancellation). No game-outcome logic
+  remains inline in `hex.js`. The HvH boundary is still seeded once and maintained by
+  `updateBoundaryForColored` (the incremental invariant below), inside `stepBattle`.
+- **Escape-driver fidelity invariant.** `stepEscape` reports only *newly*-colored cells in
+  `sim.colored` (mirroring the old `getHexColor`'s push-only-when-new), and the driver's `visitedCount`
+  (= start cell + 1 per colored cell) equals the old `visited.size` *only because* in a real escape run
+  every visited neighbor is freshly colored — the sole pre-colored cell is the start hex, which begins
+  in `visited` and is never revisited. If escape mode is ever seeded with pre-colored cells reachable by
+  the BFS (e.g. a future mode), `sim.colored` would undercount the visited neighbors and the status
+  line / per-cell pacing would drift. `createEscape`/`stepEscape` are pinned to the original inline BFS
+  by a 180-run faithful-reimplementation equivalence test — keep it.
+- **`escapeDistance` guard (both `createEscape` and `createBattle`).** The guard is
+  `!Number.isFinite(x) || x <= 0` (falls back to the default). It rejects 0, negatives, NaN, **and
+  ±Infinity** — the earlier `!(x > 0)` form let `+Infinity` slip through, contradicting the docstrings.
+  Both guards are tested with `[0, -5, NaN, Infinity, -Infinity]`. The param is test-facing; no
+  production caller passes it.
 - **Incremental-boundary invariant (HvH).** The `boundary` Set is maintained by `updateBoundaryForColored`
   instead of a per-step `getFrontiers` rescan. This is only valid because each step colors exactly one
   *previously-untested* cell (coloring is monotonic — colors are added, never changed/removed). If the

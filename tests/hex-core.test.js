@@ -6,6 +6,7 @@ import {
     getTouchedColors, getFrontiers, updateBoundaryForColored,
     isHexTrapped, findEncircledPockets,
     determineBattleWinner, createBattle, stepBattle,
+    createEscape, stepEscape,
     sliderToSpeed, speedToLabel, computePacing,
 } from '../hex-core.js';
 
@@ -735,13 +736,254 @@ describe('createBattle / stepBattle', () => {
 
     it('falls back to the default escape distance for a non-positive or non-finite value', () => {
         // The escapeDistance param is test-facing; guard the degenerate values that
-        // would otherwise make every battle resolve instantly or corrupt trap floods.
-        for (const bad of [0, -5, NaN]) {
+        // would otherwise make every battle resolve instantly (0/negative), never trip
+        // the distance cap (+Infinity), or corrupt the trap floods (NaN).
+        for (const bad of [0, -5, NaN, Infinity, -Infinity]) {
             expect(createBattle({ q: 0, r: 0 }, { q: 1, r: 0 }, openingBoard(), bad).escapeDistance)
                 .toBe(CONFIG.ESCAPE_DISTANCE);
         }
         // A sensible positive value is kept as-is.
         expect(createBattle({ q: 0, r: 0 }, { q: 1, r: 0 }, openingBoard(), 3).escapeDistance).toBe(3);
+    });
+});
+
+// --- createEscape / stepEscape ---
+
+describe('createEscape / stepEscape', () => {
+    // A board holding only the white start hex, as the live game has it after the
+    // click (setHexColor(start, true)) and before the BFS runs.
+    function openingBoard(q = 0, r = 0) {
+        const hexColors = new Map();
+        hexColors.set(numKey(q, r), true);
+        return hexColors;
+    }
+
+    // Drive a full run via the pure stepper, collecting the colored sequence and the
+    // final board — the shape the equivalence test compares against the reference.
+    function runStepper(startQ, startR, escapeDistance, rng) {
+        const hexColors = openingBoard(startQ, startR);
+        const sim = createEscape(startQ, startR, hexColors, escapeDistance);
+        const colored = [];
+        let guard = 0;
+        while (!sim.done) {
+            stepEscape(sim, rng);
+            for (const c of sim.colored) colored.push(c);
+            if (++guard > 200000) throw new Error('stepper did not terminate');
+        }
+        return { escaped: sim.escaped, distance: sim.distance, colored, finalColors: hexColors };
+    }
+
+    // A faithful, DOM-free re-implementation of the ORIGINAL inline checkEncirclement
+    // BFS (dequeue node → escape-distance check → expand 6 neighbors with lazy random
+    // coloring via getHexColor). The equivalence test below pins the new stepper to
+    // this, so the extraction provably preserves the escaped/encircled outcome, the
+    // distance, AND the full coloring order — the same bar the HvH extraction met.
+    function runReference(startQ, startR, escapeDistance, rng) {
+        const hexColors = openingBoard(startQ, startR);
+        const visited = new Set([numKey(startQ, startR)]);
+        const queueQ = [startQ];
+        const queueR = [startR];
+        const queueDist = [0];
+        let queueHead = 0;
+        let maxDistReached = 0;
+        const colored = [];
+
+        while (queueHead < queueQ.length) {
+            const q = queueQ[queueHead];
+            const r = queueR[queueHead];
+            const dist = queueDist[queueHead++];
+            maxDistReached = Math.max(maxDistReached, dist);
+
+            if (dist >= escapeDistance) {
+                return { escaped: true, distance: dist, colored, finalColors: hexColors };
+            }
+
+            for (let i = 0; i < 6; i++) {
+                const nq = q + NEIGHBOR_OFFSETS[i][0];
+                const nr = r + NEIGHBOR_OFFSETS[i][1];
+                const nk = numKey(nq, nr);
+                if (visited.has(nk)) continue;
+                visited.add(nk);
+
+                let isWhite = hexColors.get(nk);
+                if (isWhite === undefined) {
+                    isWhite = rng() < 0.5;
+                    hexColors.set(nk, isWhite);
+                    // getHexColor only pushed a GPU instance for newly-colored cells.
+                    colored.push({ q: nq, r: nr, isWhite });
+                }
+
+                if (isWhite) {
+                    queueQ.push(nq);
+                    queueR.push(nr);
+                    queueDist.push(dist + 1);
+                }
+            }
+        }
+        return { escaped: false, distance: maxDistReached, colored, finalColors: hexColors };
+    }
+
+    function coloredKey(seq) {
+        return seq.map(c => `${c.q},${c.r},${c.isWhite}`).join('|');
+    }
+
+    function mapsEqual(a, b) {
+        if (a.size !== b.size) return false;
+        for (const [k, v] of a) if (!b.has(k) || b.get(k) !== v) return false;
+        return true;
+    }
+
+    it('seeds the BFS from the start hex (open board, not yet decided)', () => {
+        const sim = createEscape(0, 0, openingBoard(), 10);
+        expect(sim.done).toBe(false);
+        expect(sim.queueQ).toEqual([0]);
+        expect(sim.queueR).toEqual([0]);
+        expect(sim.visited.has(numKey(0, 0))).toBe(true);
+        expect(sim.maxDistReached).toBe(0);
+    });
+
+    it('is deterministic: equal rng draws ⇒ identical colored sequence and result', () => {
+        const a = runStepper(0, 0, 8, mulberry32(777));
+        const b = runStepper(0, 0, 8, mulberry32(777));
+        expect(a.escaped).toBe(b.escaped);
+        expect(a.distance).toBe(b.distance);
+        expect(coloredKey(a.colored)).toBe(coloredKey(b.colored));
+        expect(a.colored.length).toBeGreaterThan(0);   // non-vacuous: it really stepped
+    });
+
+    it('colors a node\'s six neighbors in NEIGHBOR_OFFSETS order, one rng draw each', () => {
+        // Alternating draws (white, black, white, …) map onto the 6 neighbor offsets
+        // in order, proving the draw order and that each cell costs exactly one draw.
+        const draws = [0.1, 0.9, 0.1, 0.9, 0.1, 0.9];   // < 0.5 ⇒ white, ≥ 0.5 ⇒ black
+        let i = 0;
+        const rng = () => draws[i++];
+        const sim = createEscape(0, 0, openingBoard(), 10);
+        stepEscape(sim, rng);   // processes the start node, coloring its 6 neighbors
+        expect(sim.maxDistReached).toBe(0);             // the start node sits at distance 0
+        expect(sim.exposedCount).toBe(1);               // just the start node in flight
+        expect(sim.colored).toEqual(NEIGHBOR_OFFSETS.map(([dq, dr], k) => ({
+            q: dq, r: dr, isWhite: k % 2 === 0,
+        })));
+        expect(i).toBe(6);                              // exactly six draws consumed
+    });
+
+    it('escapes when the flood always spreads (all-white coloring)', () => {
+        // rng < 0.5 always ⇒ every neighbor white ⇒ the BFS expands in all directions
+        // and the first cell dequeued at the escape radius wins.
+        const result = runStepper(0, 0, 4, () => 0);
+        expect(result.escaped).toBe(true);
+        expect(result.distance).toBe(4);
+    });
+
+    it('is encircled immediately when the start is walled off (all-black coloring)', () => {
+        // rng ≥ 0.5 always ⇒ all six neighbors of the start are black, none enqueued,
+        // so the queue drains at distance 0.
+        const result = runStepper(0, 0, 10, () => 0.9);
+        expect(result.escaped).toBe(false);
+        expect(result.distance).toBe(0);
+        expect(result.colored).toHaveLength(6);                  // the six black neighbors
+        expect(result.colored.every(c => c.isWhite === false)).toBe(true);
+    });
+
+    it('colors nothing on the terminal step that decides the outcome', () => {
+        // The driver relies on a terminal step coloring no cells (it breaks on
+        // sim.done before touching the GPU). All-black drains the queue: step 1 colors
+        // the six black neighbors, step 2 is the deciding (encircled) step.
+        const sim = createEscape(0, 0, openingBoard(), 10);
+        stepEscape(sim, () => 0.9);
+        expect(sim.done).toBe(false);
+        expect(sim.colored).toHaveLength(6);
+        stepEscape(sim, () => 0.9);            // terminal step — decides 'encircled'
+        expect(sim.done).toBe(true);
+        expect(sim.escaped).toBe(false);
+        expect(sim.colored).toEqual([]);       // nothing colored on the deciding step
+    });
+
+    it('respects pre-existing colors (lazy coloring keeps a seeded cell)', () => {
+        // Pre-seed one neighbor black; with an otherwise all-white rng it must stay
+        // black (no redraw) and therefore never join the flood.
+        const hexColors = openingBoard();
+        const seeded = numKey(1, 0);   // (1,0) is the first NEIGHBOR_OFFSETS entry
+        hexColors.set(seeded, false);
+        const sim = createEscape(0, 0, hexColors, 10);
+        stepEscape(sim, () => 0);   // all-white draws for the cells it actually colors
+        expect(hexColors.get(seeded)).toBe(false);              // unchanged, no redraw
+        // (1,0) was already colored, so it isn't re-reported in `colored` (nothing new
+        // to push to the GPU) and, being black, it isn't enqueued. Only the five
+        // freshly-whitened neighbors are reported and continue the flood.
+        expect(sim.colored.some(c => c.q === 1 && c.r === 0)).toBe(false);
+        expect(sim.colored).toHaveLength(5);
+        expect(sim.colored.every(c => c.isWhite === true)).toBe(true);
+        // queue = the start node (still in the array) + the 5 enqueued white cells.
+        expect(sim.queueQ).toHaveLength(6);
+    });
+
+    it('matches a faithful reimplementation of the original BFS across many runs', () => {
+        // The core guarantee: the extracted stepper reproduces the original inline
+        // loop's outcome, distance, full colored sequence, AND final board, over a
+        // broad seed sweep. 180 runs (3 escape distances × 60 seeds), at p = 0.5 so
+        // both escape and encirclement occur.
+        let escapes = 0, encirclements = 0, totalColored = 0;
+        for (const escapeDistance of [5, 8, 12]) {
+            for (let seed = 1; seed <= 60; seed++) {
+                const ref = runReference(0, 0, escapeDistance, mulberry32(seed));
+                const got = runStepper(0, 0, escapeDistance, mulberry32(seed));
+
+                expect(got.escaped).toBe(ref.escaped);
+                expect(got.distance).toBe(ref.distance);
+                expect(coloredKey(got.colored)).toBe(coloredKey(ref.colored));
+                expect(mapsEqual(got.finalColors, ref.finalColors)).toBe(true);
+
+                if (ref.escaped) escapes++; else encirclements++;
+                totalColored += ref.colored.length;
+            }
+        }
+        // Non-vacuity: the sweep must exercise BOTH outcomes and do real work, or the
+        // equivalence above could pass trivially.
+        expect(escapes).toBeGreaterThan(0);
+        expect(encirclements).toBeGreaterThan(0);
+        expect(totalColored).toBeGreaterThan(1000);
+    });
+
+    it('tracks maxDistReached as the BFS advances', () => {
+        // All-white flood with no escape cap reached within a few rings: the distance
+        // climbs ring by ring. Step until a cell at distance 2 has been dequeued.
+        const sim = createEscape(0, 0, openingBoard(), 1000);
+        for (let i = 0; i < 25 && sim.maxDistReached < 2; i++) stepEscape(sim, () => 0);
+        expect(sim.maxDistReached).toBeGreaterThanOrEqual(2);
+        expect(sim.done).toBe(false);
+    });
+
+    it('is a no-op once the run is done', () => {
+        const sim = createEscape(0, 0, openingBoard(), 10);
+        // All-black ⇒ resolves (encircled) on the second step.
+        stepEscape(sim, () => 0.9);
+        stepEscape(sim, () => 0.9);
+        expect(sim.done).toBe(true);
+        const snapshot = {
+            escaped: sim.escaped, distance: sim.distance, done: sim.done,
+            maxDist: sim.maxDistReached, hexSize: sim.hexColors.size,
+            queueLen: sim.queueQ.length, head: sim.queueHead,
+        };
+        const result = stepEscape(sim, () => 0);   // must not advance anything
+        expect(result).toBe(sim);                  // returns the same sim
+        expect(sim.colored).toEqual([]);           // no cells colored
+        expect({
+            escaped: sim.escaped, distance: sim.distance, done: sim.done,
+            maxDist: sim.maxDistReached, hexSize: sim.hexColors.size,
+            queueLen: sim.queueQ.length, head: sim.queueHead,
+        }).toEqual(snapshot);
+    });
+
+    it('falls back to the default escape distance for a non-positive or non-finite value', () => {
+        // Mirrors createBattle's guard: 0/negative would escape from the start cell,
+        // +Infinity would never escape, and NaN would never escape (dist >= NaN is
+        // always false) — so every non-finite-or-non-positive value falls back.
+        for (const bad of [0, -5, NaN, Infinity, -Infinity]) {
+            expect(createEscape(0, 0, openingBoard(), bad).escapeDistance)
+                .toBe(CONFIG.ESCAPE_DISTANCE);
+        }
+        expect(createEscape(0, 0, openingBoard(), 7).escapeDistance).toBe(7);
     });
 });
 

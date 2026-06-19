@@ -36,6 +36,7 @@ Exports:
 - `findEncircledPockets(hexColors)` — Find untested regions surrounded only by black
 - `determineBattleWinner(whiteStart, blackStart, maxDist, hexColors)` — Decide a hex-vs-hex outcome (`'white'`/`'black'`/`'unresolved'`), or `null` if still undecided
 - `createBattle(whiteStart, blackStart, hexColors, escapeDistance?)` / `stepBattle(sim, rng)` — Pure hex-vs-hex simulation: `createBattle` seeds the state (boundary, trackers); `stepBattle` advances it one cell using an injected RNG, owning all win/draw logic. `hex.js` drives these and handles only the GPU/render/pacing side effects.
+- `createEscape(startQ, startR, hexColors, escapeDistance?)` / `stepEscape(sim, rng)` — Pure escape-mode BFS: `createEscape` seeds the flood (visited set + queue); `stepEscape` advances it one BFS node using an injected RNG, lazily coloring the node's neighbors (50/50), enqueuing the white ones, and owning the escaped/encircled decision. Each step reports the cells it colored (`sim.colored`) so the driver can mirror them to the GPU. Same `escapeDistance` guard as `createBattle` (non-finite/non-positive falls back to the default).
 - `sliderToSpeed(value)` / `speedToLabel(speed)` — Map the speed slider to a multiplier and its display label
 - `computePacing(count, speedMultiplier)` — Per-step animation pacing (batch size + delay) from the live frontier size
 
@@ -49,9 +50,9 @@ A one-class module owning a monotonic generation counter. The escape/battle loop
 The main application file. Imports from `hex-core.js`, `run-tracker.js`, and `run-session.js`. Handles:
 - WebGL2 instanced rendering (hex geometry as triangle fan)
 - Canvas overlay for start hex marker
-- Game loops cancellable via the shared `runSession`:
-  - `checkEncirclement` — the escape-mode BFS (still inline, since its lazy random coloring is interleaved with GPU pushes).
-  - `hexVsHexCheck` — a thin driver over the pure `createBattle`/`stepBattle` in `hex-core.js`. The simulation (cell selection, coloring, incremental boundary maintenance, win/draw detection) lives in the core and is unit-tested; the driver only mirrors each colored cell into the GPU buffer and handles pacing, rendering, and cancellation. The boundary is seeded once and maintained with `updateBoundaryForColored`, so per-step cost stays O(1) in the boundary rather than O(N) in the whole board.
+- Game loops cancellable via the shared `runSession`. Both are now thin drivers over a pure stepper in `hex-core.js` — the simulation (cell selection, coloring, win/escape detection) lives in the core and is unit-tested, and the driver only mirrors each colored cell into the GPU buffer and handles pacing, rendering, and cancellation:
+  - `checkEncirclement` — drives `createEscape`/`stepEscape`. Each `stepEscape` processes one BFS node and returns the cells it colored; the driver iterates them, keeping the original per-neighbor pacing granularity (`stepCount` ticks once per colored cell) and the exact status readout.
+  - `hexVsHexCheck` — drives `createBattle`/`stepBattle`. The boundary is seeded once and maintained with `updateBoundaryForColored`, so per-step cost stays O(1) in the boundary rather than O(N) in the whole board.
 - User interaction (click placement, pan, zoom, speed control)
 - Two `RunTracker` instances (`escapeTracker`, `hvhTracker`)
 
@@ -77,7 +78,7 @@ Coordinates are encoded as numeric keys via `numKey(q, r)` for fast Map lookups,
 ## Testing
 
 - Framework: Vitest (ES module native, no build step)
-- `tests/hex-core.test.js` — Pure logic tests (coordinate math, BFS, pocket detection, incremental-boundary equivalence with `getFrontiers`, and hex-vs-hex battle outcomes via `determineBattleWinner`/`stepBattle`)
+- `tests/hex-core.test.js` — Pure logic tests (coordinate math, BFS, pocket detection, incremental-boundary equivalence with `getFrontiers`, hex-vs-hex battle outcomes via `determineBattleWinner`/`stepBattle`, and escape-mode outcomes via `createEscape`/`stepEscape` — including a faithful-reimplementation equivalence sweep that pins the extracted stepper to the original inline BFS across many seeds)
 - `tests/run-tracker.test.js` — Run tracking with in-memory storage adapter
 - `tests/run-session.test.js` — Run cancellation token (begin/cancel/supersede semantics)
 - Run: `npm test`

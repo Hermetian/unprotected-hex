@@ -352,11 +352,12 @@ export function determineBattleWinner(whiteStart, blackStart, maxDist, hexColors
 // stepBattle — see updateBoundaryForColored for why that stays exact. The battle
 // is declared an unresolved draw once a colored cell reaches `escapeDistance` from
 // the origin (defaults to the game's escape radius; a smaller positive value is
-// handy in tests). A non-positive or non-finite escapeDistance is meaningless — it
-// would make every battle resolve instantly (or, for NaN, corrupt the trap floods,
-// since `hexDist >= NaN` is always false) — so it falls back to the default.
+// handy in tests). A non-positive or non-finite escapeDistance is meaningless — 0 or a
+// negative resolves every battle instantly, +Infinity never trips the cap, and NaN
+// corrupts the trap floods (since `hexDist >= NaN` is always false) — so any such value
+// falls back to the default.
 export function createBattle(whiteStart, blackStart, hexColors, escapeDistance = CONFIG.ESCAPE_DISTANCE) {
-    if (!(escapeDistance > 0)) escapeDistance = CONFIG.ESCAPE_DISTANCE;
+    if (!Number.isFinite(escapeDistance) || escapeDistance <= 0) escapeDistance = CONFIG.ESCAPE_DISTANCE;
     return {
         whiteStart,
         blackStart,
@@ -422,6 +423,124 @@ export function stepBattle(sim, rng) {
         sim.winner = winner;
         sim.done = true;
     }
+    return sim;
+}
+
+// --- Escape-mode BFS (pure simulation) ---
+// Escape mode floods outward from a start hex through neighbors that are *randomly*
+// colored white (50/50); the region "escapes" if any cell reaches escapeDistance and
+// is "encircled" if the flood dies out first. As with the hex-vs-hex battle, the
+// outcome (escaped vs encircled, the distance reached, the exact final coloring) is
+// pure — it depends only on the start position and the rng draw sequence, not on the
+// DOM or WebGL. These functions own that logic so it is unit-testable; hex.js drives
+// them and handles only the side effects (GPU push, pacing, rendering, cancellation).
+
+// Create the mutable state for an escape-mode run. `hexColors` should already hold
+// the white start hex at (startQ, startR); it is mutated in place as the BFS colors
+// cells. The region escapes once a *dequeued* cell sits at or beyond `escapeDistance`
+// from the origin (defaults to the game's escape radius; a smaller positive value is
+// handy in tests). A non-positive or non-finite escapeDistance is meaningless — 0 or a
+// negative escapes from the start cell, +Infinity never escapes, and NaN never escapes
+// either (since `dist >= NaN` is always false) — so any such value falls back to the
+// default, matching createBattle's guard.
+export function createEscape(startQ, startR, hexColors, escapeDistance = CONFIG.ESCAPE_DISTANCE) {
+    if (!Number.isFinite(escapeDistance) || escapeDistance <= 0) escapeDistance = CONFIG.ESCAPE_DISTANCE;
+    return {
+        hexColors,
+        escapeDistance,
+        visited: new Set([numKey(startQ, startR)]),
+        // Parallel-array BFS queue (q, r, dist), consumed via a moving head index.
+        queueQ: [startQ],
+        queueR: [startR],
+        queueDist: [0],
+        queueHead: 0,
+        maxDistReached: 0,
+        // Per-step scratch the driver reads after each step():
+        exposedCount: 0,    // BFS frontier size BEFORE this step's expansion (pacing/status)
+        colored: [],    // cells colored this step: [{ q, r, isWhite }, ...] in neighbor order
+        // Terminal state:
+        escaped: null,    // true once a cell reaches escapeDistance, false once encircled
+        distance: 0,    // distance reported at termination
+        done: false,
+    };
+}
+
+// Advance an escape run by one BFS node, mutating `sim` (and its hexColors). `rng`
+// is a function returning a float in [0, 1) — inject Math.random in the app, a
+// seeded PRNG in tests. After the call:
+//   - sim.colored lists the cells colored this step (the dequeued node's not-yet-
+//     visited neighbors, in NEIGHBOR_OFFSETS order; empty on a terminal step)
+//   - sim.maxDistReached is this node's distance and sim.exposedCount the pre-expansion
+//     frontier size — the driver's status line and pacing read both
+//   - sim.done / sim.escaped / sim.distance are set once the outcome is decided
+// The dequeue → escape-check → expand order matches the original inline loop exactly,
+// and exactly one rng draw is spent per newly-colored cell, so given the same draws
+// the escaped/encircled outcome and the final board are identical.
+export function stepEscape(sim, rng) {
+    if (sim.done) return sim;
+    const { hexColors, visited, queueQ, queueR, queueDist, escapeDistance } = sim;
+
+    sim.colored = [];
+
+    // Queue exhausted before reaching the escape distance: the region is encircled.
+    if (sim.queueHead >= queueQ.length) {
+        sim.escaped = false;
+        sim.distance = sim.maxDistReached;
+        sim.done = true;
+        return sim;
+    }
+
+    const q = queueQ[sim.queueHead];
+    const r = queueR[sim.queueHead];
+    const dist = queueDist[sim.queueHead++];
+    // BFS dequeues in nondecreasing distance order, so each node's distance is the new
+    // maximum; the driver reads sim.maxDistReached for its status line (as the HvH
+    // driver does), which is therefore exactly this node's distance.
+    if (dist > sim.maxDistReached) sim.maxDistReached = dist;
+
+    // Frontier size used by the driver for pacing/status — the remaining queued
+    // nodes plus this one. Matches the old inline `queueQ.length - queueHead + 1`,
+    // captured BEFORE this node's children are enqueued.
+    sim.exposedCount = queueQ.length - sim.queueHead + 1;
+
+    // Reached the escape radius: the region broke out into open space. No neighbors
+    // are colored on this terminal step (the original returned before expanding).
+    if (dist >= escapeDistance) {
+        sim.escaped = true;
+        sim.distance = dist;
+        sim.done = true;
+        return sim;
+    }
+
+    for (let i = 0; i < 6; i++) {
+        const nq = q + NEIGHBOR_OFFSETS[i][0];
+        const nr = r + NEIGHBOR_OFFSETS[i][1];
+        const nk = numKey(nq, nr);
+        if (visited.has(nk)) continue;
+        visited.add(nk);
+
+        // Lazy random coloring (50/50), exactly as the live game's getHexColor: a
+        // cell keeps any pre-existing color, otherwise a fresh draw decides it. Only a
+        // freshly-colored cell is reported in `colored` (and thus pushed to the GPU),
+        // mirroring getHexColor's push-only-when-new behavior. In a real escape run
+        // every visited neighbor is in fact new — the sole pre-colored cell is the
+        // start hex, which begins in `visited` and is never revisited — so this branch
+        // matters only for seeded boards (e.g. tests).
+        let isWhite = hexColors.get(nk);
+        if (isWhite === undefined) {
+            isWhite = rng() < 0.5;
+            hexColors.set(nk, isWhite);
+            sim.colored.push({ q: nq, r: nr, isWhite });
+        }
+
+        // Only white cells continue the flood; black cells are colored but dead ends.
+        if (isWhite) {
+            queueQ.push(nq);
+            queueR.push(nr);
+            queueDist.push(dist + 1);
+        }
+    }
+
     return sim;
 }
 

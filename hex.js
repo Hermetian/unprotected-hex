@@ -2,8 +2,9 @@
 // WebGL instanced rendering for massive performance
 
 import {
-    CONFIG, NEIGHBOR_OFFSETS,
+    CONFIG,
     numKey, pixelToAxial,
+    createEscape, stepEscape,
     createBattle, stepBattle, findEncircledPockets,
     sliderToSpeed, speedToLabel, computePacing,
 } from './hex-core.js';
@@ -246,19 +247,6 @@ function getHexHeight() {
     return 2 * getHexSize();
 }
 
-// Get or assign color to a hex
-function getHexColor(q, r) {
-    const key = numKey(q, r);
-    let color = hexColors.get(key);
-    if (color === undefined) {
-        color = Math.random() < 0.5;
-        hexColors.set(key, color);
-        hexInstances.push({ q, r, color: color ? 1 : 0 });
-        instanceBufferDirty = true;
-    }
-    return color;
-}
-
 function setHexColor(q, r, isWhite) {
     const key = numKey(q, r);
     const isNew = !hexColors.has(key);
@@ -353,56 +341,49 @@ function drawStartMarker() {
     ctx2d.fill();
 }
 
-// BFS encirclement check
+// Main escape-mode check loop. The BFS itself (lazy random coloring, the
+// escaped/encircled decision, distance) lives in the pure createEscape/stepEscape in
+// hex-core.js and is unit-tested there; this driver only mirrors each colored cell
+// into the GPU buffer and handles pacing, rendering, and cancellation.
 async function checkEncirclement(startQ, startR, token) {
-    const visited = new Set();
-    const queueQ = [startQ];
-    const queueR = [startR];
-    const queueDist = [0];
-    let queueHead = 0;
-    visited.add(numKey(startQ, startR));
+    const sim = createEscape(startQ, startR, hexColors);
 
-    let maxDistReached = 0;
     let stepCount = 0;
+    // Mirrors the original loop's `visited.size` for the status line — the start cell
+    // plus one per colored cell — so the readout is byte-for-byte identical without
+    // the driver owning the visited set (that lives in sim).
+    let visitedCount = 1;
     let lastRenderTime = performance.now();
 
-    while (queueHead < queueQ.length) {
-        const q = queueQ[queueHead];
-        const r = queueR[queueHead];
-        const dist = queueDist[queueHead++];
-        maxDistReached = Math.max(maxDistReached, dist);
-        currentMaxDist = maxDistReached;  // Track for interruption
+    while (!sim.done) {
+        stepEscape(sim, Math.random);
+        currentMaxDist = sim.maxDistReached;  // Track for interruption
 
-        const exposedCount = queueQ.length - queueHead + 1;
+        // Terminal step (escaped: a cell reached the radius; or encircled: the queue
+        // drained) — nothing was colored. Render the final board once below.
+        if (sim.done) break;
+
+        // The dequeued node sits at sim.maxDistReached (BFS dequeues in nondecreasing
+        // distance order, so the running max equals this node's distance); together
+        // with the pre-expansion frontier size it drives the status text and pacing.
+        // Pacing is computed once per node, so every colored cell of this node shares it.
+        const dist = sim.maxDistReached;
+        const exposedCount = sim.exposedCount;
         const { isMaxSpeed, delay, batchSize } = computePacing(exposedCount, speedMultiplier);
 
-        if (dist >= CONFIG.ESCAPE_DISTANCE) {
-            render();
-            return { escaped: true, distance: dist };
-        }
-
-        for (let i = 0; i < 6; i++) {
-            const nq = q + NEIGHBOR_OFFSETS[i][0];
-            const nr = r + NEIGHBOR_OFFSETS[i][1];
-            const nk = numKey(nq, nr);
-
-            if (visited.has(nk)) continue;
-            visited.add(nk);
-
-            const isWhite = getHexColor(nq, nr);
+        // Mirror each freshly-colored cell into the GPU instance buffer, keeping the
+        // original's per-cell pacing granularity (stepCount ticks once per cell).
+        for (const cell of sim.colored) {
+            hexInstances.push({ q: cell.q, r: cell.r, color: cell.isWhite ? 1 : 0 });
+            instanceBufferDirty = true;
             stepCount++;
-
-            if (isWhite) {
-                queueQ.push(nq);
-                queueR.push(nr);
-                queueDist.push(dist + 1);
-            }
+            visitedCount++;
 
             if (isMaxSpeed) {
                 if (stepCount % 1000 === 0) {
                     const now = performance.now();
                     if (now - lastRenderTime > 50) {
-                        statusDiv.textContent = `Distance: ${dist} | Frontier: ${exposedCount} | Visited: ${visited.size}`;
+                        statusDiv.textContent = `Distance: ${dist} | Frontier: ${exposedCount} | Visited: ${visitedCount}`;
                         render();
                         lastRenderTime = now;
                     }
@@ -415,7 +396,7 @@ async function checkEncirclement(startQ, startR, token) {
                 if (stepCount % batchSize === 0) {
                     const now = performance.now();
                     if (now - lastRenderTime > 16) {
-                        statusDiv.textContent = `Distance: ${dist} | Frontier: ${exposedCount} | Visited: ${visited.size}`;
+                        statusDiv.textContent = `Distance: ${dist} | Frontier: ${exposedCount} | Visited: ${visitedCount}`;
                         render();
                         lastRenderTime = now;
                     }
@@ -429,7 +410,7 @@ async function checkEncirclement(startQ, startR, token) {
     }
 
     render();
-    return { escaped: false, distance: maxDistReached };
+    return { escaped: sim.escaped, distance: sim.distance };
 }
 
 function sleep(ms) {
